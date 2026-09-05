@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -220,9 +224,11 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
         conn2.close()
 
 
-def test_block_happy_path(worker_env):
+def test_block_happy_path(monkeypatch, worker_env):
+    """Explicit non-worker callers retain the legacy immediate transition."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification"})
+    out = kt._handle_block({"task_id": worker_env, "reason": "need clarification"})
     d = json.loads(out)
     assert d["ok"] is True
     from hermes_cli import kanban_db as kb
@@ -230,6 +236,164 @@ def test_block_happy_path(worker_env):
     conn = kbc.connect()
     try:
         assert kb.get_task(conn, worker_env).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_worker_block_before_pid_registration_is_retryable(monkeypatch, worker_env):
+    """A worker cannot request an unobservable block before PID persistence."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    conn = kbc.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", task.claim_lock)
+    finally:
+        conn.close()
+
+    result = json.loads(kt._handle_block({"reason": "wait for pid"}))
+    assert "error" in result
+    assert "retry" in result["error"].lower()
+
+    conn = kbc.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+        assert not any(e.kind == "block_requested" for e in kb.list_events(conn, worker_env))
+    finally:
+        conn.close()
+
+
+def test_worker_block_commits_then_exits_before_sentinel(worker_env, tmp_path):
+    """The real handler durably requests a block and never returns to worker code."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    conn = kbc.connect()
+    try:
+        before = kb.get_task(conn, worker_env)
+        run_id = before.current_run_id
+        claim_lock = before.claim_lock
+    finally:
+        conn.close()
+
+    go = tmp_path / "go"
+    sentinel = tmp_path / "after-block"
+    child_script = tmp_path / "block_worker.py"
+    child_script.write_text(
+        "import os, time\n"
+        "from pathlib import Path\n"
+        "from tools import kanban_tools as kt\n"
+        "go = Path(os.environ['K04_GO'])\n"
+        "while not go.exists(): time.sleep(0.01)\n"
+        "kt._handle_block({'reason': 'child requested input', 'kind': 'needs_input'})\n"
+        "Path(os.environ['K04_SENTINEL']).write_text('handler returned', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update({
+        "HERMES_KANBAN_TASK": worker_env,
+        "HERMES_KANBAN_RUN_ID": str(run_id),
+        "HERMES_KANBAN_CLAIM_LOCK": claim_lock,
+        "K04_GO": str(go),
+        "K04_SENTINEL": str(sentinel),
+        "PYTHONPATH": str(Path(__file__).parents[2]),
+    })
+    proc = subprocess.Popen(
+        [sys.executable, str(child_script)],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        conn = kbc.connect()
+        try:
+            kbd._set_worker_pid(conn, worker_env, proc.pid)
+        finally:
+            conn.close()
+        go.write_text("go", encoding="utf-8")
+        assert proc.wait(timeout=15) == 0
+        assert not sentinel.exists()
+
+        conn = kbc.connect()
+        try:
+            requested = kb.get_task(conn, worker_env)
+            assert requested.status == "blocking"
+            assert requested.current_run_id == run_id
+            assert requested.worker_pid == proc.pid
+            assert requested.claim_lock == claim_lock
+            assert kb.latest_run(conn, worker_env).ended_at is None
+            assert [e.kind for e in kb.list_events(conn, worker_env)].count("block_requested") == 1
+
+            assert kbd.finalize_requested_worker_blocks(conn) == [worker_env]
+            finalized = kb.get_task(conn, worker_env)
+            assert finalized.status == "blocked"
+            assert finalized.current_run_id is None
+            assert finalized.worker_pid is None
+            assert finalized.claim_lock is None
+            run = kb.latest_run(conn, worker_env)
+            assert run.id == run_id
+            assert run.ended_at is not None
+            assert run.outcome == "blocked"
+            assert run.summary == "child requested input"
+            final_event = kb.list_events(conn, worker_env)[-1]
+            assert final_event.kind == "blocked"
+            assert final_event.run_id == run_id
+            assert final_event.payload["kind"] == "needs_input"
+            assert final_event.payload["reason"] == "child requested input"
+        finally:
+            conn.close()
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+def test_worker_block_commit_failure_rolls_back_without_exit(monkeypatch, worker_env):
+    """Phase 1 cannot exit or leave durable intent when COMMIT fails."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+    from tools import kanban_tools as kt
+
+    conn = kbc.connect()
+    try:
+        kbd._set_worker_pid(conn, worker_env, os.getpid())
+        claimed = kb.get_task(conn, worker_env)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claimed.claim_lock)
+    finally:
+        conn.close()
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
+
+    def unexpected_exit(code):
+        raise AssertionError(f"must not exit after failed commit: {code}")
+
+    monkeypatch.setattr(kt.os, "_exit", unexpected_exit)
+    original_boundary = kbc._execute_boundary_with_retry
+
+    def fail_commit(conn_arg, sql, *args, **kwargs):
+        if sql == "COMMIT":
+            raise sqlite3.OperationalError("injected COMMIT failure")
+        return original_boundary(conn_arg, sql, *args, **kwargs)
+
+    monkeypatch.setattr(kbc, "_execute_boundary_with_retry", fail_commit)
+    result = json.loads(kt._handle_block({"reason": "operator input", "kind": "needs_input"}))
+    assert "COMMIT failure" in result["error"]
+
+    conn = kbc.connect()
+    try:
+        after = kb.get_task(conn, worker_env)
+        assert after.status == "running"
+        assert after.current_run_id == claimed.current_run_id
+        assert after.worker_pid == claimed.worker_pid
+        assert after.claim_lock == claimed.claim_lock
+        assert kb.latest_run(conn, worker_env).ended_at is None
+        assert not any(event.kind == "block_requested" for event in kb.list_events(conn, worker_env))
     finally:
         conn.close()
 

@@ -11,13 +11,16 @@ parity across every registered verb.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -417,23 +420,248 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         kb.claim_task(conn, tid)
         run1 = kb.latest_run(conn, tid)
         kbd._set_worker_pid(conn, tid, 98765)
+        attempt1 = kb.get_task(conn, tid)
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
         assert kbd.detect_crashed_workers(conn) == [tid]
 
         kb.claim_task(conn, tid)
         run2 = kb.latest_run(conn, tid)
+        kbd._set_worker_pid(conn, tid, 98766)
+        attempt2 = kb.get_task(conn, tid)
         assert run2.id != run1.id
 
         assert not kbd.heartbeat_worker(conn, tid, note="late", expected_run_id=run1.id)
         assert not kb.block_task(conn, tid, reason="late block", expected_run_id=run1.id)
+        assert not kb.request_worker_block(
+            conn, tid, reason="late request", kind="needs_input",
+            expected_run_id=run1.id, expected_worker_pid=attempt1.worker_pid,
+            expected_claim_lock=attempt1.claim_lock,
+        )
+        assert not kb.finalize_worker_block(
+            conn, tid, expected_run_id=run1.id,
+            expected_worker_pid=attempt1.worker_pid,
+            expected_claim_lock=attempt1.claim_lock,
+        )
         task = kb.get_task(conn, tid)
         assert task.status == "running"
         assert task.current_run_id == run2.id
+        assert task.worker_pid == attempt2.worker_pid
+        assert task.claim_lock == attempt2.claim_lock
         assert task.last_heartbeat_at is None
 
         assert kbd.heartbeat_worker(conn, tid, note="current", expected_run_id=run2.id)
         assert kb.block_task(conn, tid, reason="current block", expected_run_id=run2.id)
         assert kb.get_task(conn, tid).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_block_finalizer_preserves_live_worker_claim(kanban_home):
+    """Phase 2 cannot release ownership while the exact worker PID is alive."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="live blocker", assignee="worker")
+        kb.claim_task(conn, tid)
+        kbd._set_worker_pid(conn, tid, proc.pid)
+        claimed = kb.get_task(conn, tid)
+        assert kb.request_worker_block(
+            conn, tid, reason="operator input", kind="needs_input",
+            expected_run_id=claimed.current_run_id,
+            expected_worker_pid=proc.pid,
+            expected_claim_lock=claimed.claim_lock,
+        )
+
+        assert kbd.finalize_requested_worker_blocks(conn) == []
+        pending = kb.get_task(conn, tid)
+        assert pending.status == "blocking"
+        assert pending.current_run_id == claimed.current_run_id
+        assert pending.worker_pid == proc.pid
+        assert pending.claim_lock == claimed.claim_lock
+        assert kb.latest_run(conn, tid).ended_at is None
+    finally:
+        conn.close()
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["openprocess_unobservable", "wait_failed", "probe_unavailable"],
+)
+def test_block_finalizer_preserves_unknown_windows_pid_observation(
+    kanban_home, monkeypatch, fault,
+):
+    """Unavailable Windows observations are not affirmative worker death."""
+    from gateway import status as gateway_status
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="unobservable blocker", assignee="worker")
+        kb.claim_task(conn, tid)
+        kbd._set_worker_pid(conn, tid, os.getpid())
+        claimed = kb.get_task(conn, tid)
+        assert kb.request_worker_block(
+            conn, tid, reason="operator input", kind="needs_input",
+            expected_run_id=claimed.current_run_id,
+            expected_worker_pid=claimed.worker_pid,
+            expected_claim_lock=claimed.claim_lock,
+        )
+
+        kernel = SimpleNamespace(
+            OpenProcess=Mock(return_value=0),
+            GetLastError=Mock(return_value=6),
+            WaitForSingleObject=Mock(return_value=0xFFFFFFFF),
+            CloseHandle=Mock(),
+        )
+        if fault == "wait_failed":
+            kernel.OpenProcess.return_value = 123
+        elif fault == "probe_unavailable":
+            kernel.OpenProcess.side_effect = OSError("simulated unavailable observer")
+        monkeypatch.setattr(ctypes, "windll", SimpleNamespace(kernel32=kernel))
+        monkeypatch.setitem(sys.modules, "psutil", None)
+        monkeypatch.setattr(gateway_status, "_IS_WINDOWS", True)
+        monkeypatch.setattr(kbd, "_IS_WINDOWS", True, raising=False)
+
+        assert kbd._pid_alive(claimed.worker_pid)
+        assert kbd.finalize_requested_worker_blocks(conn) == []
+        pending = kb.get_task(conn, tid)
+        assert pending.status == "blocking"
+        assert pending.current_run_id == claimed.current_run_id
+        assert pending.worker_pid == claimed.worker_pid
+        assert pending.claim_lock == claimed.claim_lock
+        assert kb.latest_run(conn, tid).ended_at is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "field", ["expected_run_id", "expected_worker_pid", "expected_claim_lock"],
+)
+def test_block_finalizer_rejects_each_mismatched_identity_on_eligible_row(
+    kanban_home, field,
+):
+    """Every Phase-2 tuple member independently participates in the CAS."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="identity blocker", assignee="worker")
+        kb.claim_task(conn, tid)
+        kbd._set_worker_pid(conn, tid, os.getpid())
+        claimed = kb.get_task(conn, tid)
+        expected = {
+            "expected_run_id": claimed.current_run_id,
+            "expected_worker_pid": claimed.worker_pid,
+            "expected_claim_lock": claimed.claim_lock,
+        }
+        assert kb.request_worker_block(
+            conn, tid, reason="operator input", kind="needs_input", **expected,
+        )
+        before = kb.get_task(conn, tid)
+        events_before = kb.list_events(conn, tid)
+        expected[field] = (
+            expected[field] + ":stale"
+            if field == "expected_claim_lock"
+            else expected[field] + 1
+        )
+
+        assert not kb.finalize_worker_block(conn, tid, **expected)
+        assert kb.get_task(conn, tid) == before
+        assert kb.list_events(conn, tid) == events_before
+        assert kb.latest_run(conn, tid).ended_at is None
+    finally:
+        conn.close()
+
+
+def test_block_finalizer_observation_cannot_finalize_successor_attempt(
+    kanban_home, monkeypatch,
+):
+    """A successor installed after PID observation defeats the stale tuple CAS."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="successor blocker", assignee="worker")
+        kb.claim_task(conn, tid)
+        kbd._set_worker_pid(conn, tid, 11111)
+        first = kb.get_task(conn, tid)
+        first_identity = {
+            "expected_run_id": first.current_run_id,
+            "expected_worker_pid": first.worker_pid,
+            "expected_claim_lock": first.claim_lock,
+        }
+        assert kb.request_worker_block(
+            conn, tid, reason="first request", kind="needs_input", **first_identity,
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+        original_finalize = kb.finalize_worker_block
+        successor = {}
+
+        def install_successor_before_stale_cas(conn_arg, task_id, **stale_identity):
+            assert original_finalize(conn_arg, task_id, **stale_identity)
+            assert kb.unblock_task(conn_arg, task_id)
+            assert kb.claim_task(conn_arg, task_id)
+            kbd._set_worker_pid(conn_arg, task_id, 22222)
+            current = kb.get_task(conn_arg, task_id)
+            current_identity = {
+                "expected_run_id": current.current_run_id,
+                "expected_worker_pid": current.worker_pid,
+                "expected_claim_lock": current.claim_lock,
+            }
+            assert kb.request_worker_block(
+                conn_arg, task_id, reason="successor request", kind="needs_input",
+                **current_identity,
+            )
+            successor["task"] = kb.get_task(conn_arg, task_id)
+            return original_finalize(conn_arg, task_id, **stale_identity)
+
+        monkeypatch.setattr(kb, "finalize_worker_block", install_successor_before_stale_cas)
+        assert kbd.finalize_requested_worker_blocks(conn) == []
+        after = kb.get_task(conn, tid)
+        assert after == successor["task"]
+        assert after.status == "blocking"
+        assert after.current_run_id != first.current_run_id
+        assert after.worker_pid == 22222
+        assert after.claim_lock == successor["task"].claim_lock
+        assert kb.latest_run(conn, tid).ended_at is None
+    finally:
+        conn.close()
+
+
+def test_live_blocking_attempt_consumes_all_dispatch_capacity(kanban_home, monkeypatch, tmp_path):
+    """Board, host and profile caps stay occupied through Phase 2."""
+    conn = kbc.connect()
+    try:
+        blocker_id = kb.create_task(conn, title="capacity blocker", assignee="worker")
+        kb.claim_task(conn, blocker_id)
+        kbd._set_worker_pid(conn, blocker_id, os.getpid())
+        blocker = kb.get_task(conn, blocker_id)
+        assert kb.request_worker_block(
+            conn, blocker_id, reason="operator input", kind="needs_input",
+            expected_run_id=blocker.current_run_id,
+            expected_worker_pid=blocker.worker_pid,
+            expected_claim_lock=blocker.claim_lock,
+        )
+        neighbor = kb.create_task(conn, title="capacity neighbor", assignee="worker")
+        monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda name: True)
+        monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "normal")
+        monkeypatch.setattr(kbd, "count_running_tasks_other_boards", lambda board: 0)
+        monkeypatch.setattr(kbd._kbw, "resolve_workspace", lambda *args, **kwargs: tmp_path)
+        spawned = Mock(return_value=os.getpid())
+
+        result = kbd._dispatch_once_locked(
+            conn, spawn_fn=spawned, max_spawn=1, max_in_progress=1,
+            max_in_progress_per_profile=1, reconcile_orphans=False,
+        )
+
+        assert result.spawned == []
+        spawned.assert_not_called()
+        assert kb.get_task(conn, neighbor).status == "ready"
+        pending = kb.get_task(conn, blocker_id)
+        assert pending.status == "blocking"
+        assert pending.claim_lock == blocker.claim_lock
     finally:
         conn.close()
 

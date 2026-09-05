@@ -618,6 +618,32 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
+        if os.environ.get("HERMES_KANBAN_TASK") == tid and _is_dispatcher_owned_worker():
+            run_id = _worker_run_id(tid)
+            claim_lock = _own_task_env(tid, "HERMES_KANBAN_CLAIM_LOCK")
+            _check(
+                task and task.worker_pid is not None,
+                "worker PID is not registered yet; retry kanban_block after the dispatcher "
+                "persists this worker's PID",
+            )
+            _check(
+                run_id is not None and claim_lock,
+                "worker run/claim identity is unavailable; retry kanban_block without changing state",
+            )
+            _check(
+                int(task.worker_pid) == os.getpid(),
+                "stored worker PID does not match this process; refusing stale kanban_block request",
+            )
+            ok = kb.request_worker_block(
+                conn, tid, reason=reason, kind=kind,
+                expected_run_id=run_id, expected_worker_pid=os.getpid(),
+                expected_claim_lock=claim_lock,
+            )
+            _check(ok, f"could not request block for {tid}; retry after refreshing task ownership")
+            # request_worker_block returned only after its write transaction committed.
+            # Never return a success payload to this worker's model: the dispatcher
+            # will finalize the exact attempt after observing this PID dead.
+            os._exit(0)
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
         return _ok_landed(kb, conn, tid, "blocked", block_kind=kind)

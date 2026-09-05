@@ -86,7 +86,10 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 # --- Constants ---
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "running", "blocking", "blocked",
+    "review", "done", "archived",
+}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
@@ -2949,6 +2952,110 @@ def block_task(
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
             return True
+    _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
+    return True
+
+
+def request_worker_block(
+    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+    kind: Optional[str] = None, expected_run_id: int, expected_worker_pid: int,
+    expected_claim_lock: str,
+) -> bool:
+    """Phase 1 of a dispatcher-worker block: persist intent but retain ownership.
+
+    The exact run/PID/claim tuple is mandatory.  The caller may terminate only
+    after this function returns, because returning means the write transaction
+    committed.  Legacy/direct callers continue to use :func:`block_task`.
+    """
+    if kind is not None and kind not in VALID_BLOCK_KINDS:
+        raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    with write_txn(conn):
+        source_status = _retry_status_for_run(conn, task_id, int(expected_run_id))
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocking' "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+            "AND worker_pid = ? AND claim_lock IS ?",
+            (
+                task_id, int(expected_run_id), int(expected_worker_pid),
+                expected_claim_lock,
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "block_requested",
+            {
+                "reason": reason,
+                "kind": kind,
+                "source_status": source_status,
+                "expected_run_id": int(expected_run_id),
+                "worker_pid": int(expected_worker_pid),
+                "claim_lock": expected_claim_lock,
+            },
+            run_id=int(expected_run_id),
+        )
+    return True
+
+
+def finalize_worker_block(
+    conn: sqlite3.Connection, task_id: str, *, expected_run_id: int,
+    expected_worker_pid: int, expected_claim_lock: str,
+) -> bool:
+    """Phase 2: finalize one exact ``blocking`` attempt after observed death.
+
+    PID liveness is deliberately the dispatcher's responsibility.  This kernel
+    helper only performs the exact-tuple CAS and final transition atomically.
+    """
+    blocked_task = None
+    reason: Optional[str] = None
+    run_id: Optional[int] = None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, block_kind, block_recurrences FROM tasks "
+            "WHERE id = ? AND status = 'blocking' AND current_run_id = ? "
+            "AND worker_pid = ? AND claim_lock IS ?",
+            (
+                task_id, int(expected_run_id), int(expected_worker_pid),
+                expected_claim_lock,
+            ),
+        ).fetchone()
+        if row is None:
+            return False
+        event = _latest_event(conn, task_id, "block_requested", int(expected_run_id))
+        request = _json_dict(_row_get(event, "payload"))
+        if not request:
+            return False
+        reason = request.get("reason")
+        kind = request.get("kind")
+        if kind is not None and kind not in VALID_BLOCK_KINDS:
+            return False
+        source_status = str(request.get("source_status") or "ready")
+        new_status, event_kind, set_sql, params, payload = _route_block(
+            kind, reason, source_status,
+            prev_kind=_row_get(row, "block_kind"),
+            prev_recurrences=int(_row_get(row, "block_recurrences") or 0),
+        )
+        sql = f"""
+            UPDATE tasks
+               SET status        = '{new_status}',
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL,
+                   {set_sql}
+             WHERE id = ? AND status = 'blocking' AND current_run_id = ?
+               AND worker_pid = ? AND claim_lock IS ?
+        """
+        cas_params = (
+            *params, task_id, int(expected_run_id), int(expected_worker_pid),
+            expected_claim_lock,
+        )
+        if conn.execute(sql, cas_params).rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id, outcome="blocked", status="blocked", summary=reason,
+        )
+        _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+        blocked_task = get_task(conn, task_id)
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 

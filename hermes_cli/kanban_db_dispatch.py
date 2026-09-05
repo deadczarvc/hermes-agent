@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+_IS_WINDOWS = os.name == "nt"
+
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
@@ -207,12 +209,12 @@ def reap_worker_zombies() -> "list[int]":
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
-    """Return True if ``pid`` is still running on this host.
+    """Return False only when ``pid`` is affirmatively observed dead.
 
-    Uses ``gateway.status._pid_exists`` (OpenProcess on Windows, ``os.kill(pid, 0)``
-    on POSIX). **DO NOT** call ``os.kill(pid, 0)`` directly on Windows — there
-    ``sig=0`` is ``CTRL_C_EVENT`` broadcast to the console group, potentially
-    killing unrelated processes.
+    Unknown/unavailable observations conservatively return True so callers never
+    release a live worker's claim.  **DO NOT** call ``os.kill(pid, 0)`` on
+    Windows — there ``sig=0`` is ``CTRL_C_EVENT`` broadcast to the console group,
+    potentially killing unrelated processes.
 
     Zombies (exited, not yet reaped) still pass the existence check, so a
     worker would look "alive" forever between exit and reap. Linux: peek at
@@ -221,38 +223,60 @@ def _pid_alive(pid: Optional[int]) -> bool:
     """
     if not pid or pid <= 0:
         return False
-    from gateway.status import _pid_exists
-    if not _pid_exists(int(pid)):
-        return False
-    if sys.platform == "linux":
+    pid = int(pid)
+    try:
+        import psutil  # type: ignore
         try:
-            with open(f"/proc/{int(pid)}/status", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("State:"):
-                        # "State:\tZ (zombie)" → dead
-                        if "Z" in line.split(":", 1)[1]:
-                            return False
-                        break
-        except (FileNotFoundError, PermissionError, OSError):
-            # proc entry gone → already reaped; treat as dead.
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                return False
+        except getattr(psutil, "NoSuchProcess", ()):
+            return False
+        except Exception:
             pass
-    elif sys.platform == "darwin":
         try:
-            proc = subprocess.run(
-                ["ps", "-o", "stat=", "-p", str(int(pid))],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True, encoding='utf-8', errors='replace',
-                timeout=1,
-                check=False,
+            return bool(psutil.pid_exists(pid))
+        except Exception:
+            return True
+    except ImportError:
+        pass
+
+    if _IS_WINDOWS:
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.WaitForSingleObject.restype = ctypes.c_uint
+            kernel32.GetLastError.restype = ctypes.c_uint
+            process_query_limited_information, synchronize = 0x1000, 0x100000
+            wait_object_0 = 0x00000000
+            error_invalid_parameter = 87
+            handle = kernel32.OpenProcess(
+                process_query_limited_information | synchronize, False, pid,
             )
-            if proc.returncode != 0:
-                return False
-            if "Z" in (proc.stdout or "").strip():
-                return False
-        except (OSError, subprocess.SubprocessError, TimeoutError):
-            # If the secondary probe fails, keep the kill(0) answer.
-            pass
+            if not handle:
+                # INVALID_PARAMETER is Windows' affirmative "PID does not exist".
+                # Access denied and every other error leave liveness unknown.
+                return kernel32.GetLastError() != error_invalid_parameter
+            try:
+                observed = kernel32.WaitForSingleObject(handle, 0)
+                if observed == wait_object_0:
+                    return False
+                # WAIT_TIMEOUT is alive; WAIT_FAILED/other values are unknown.
+                return True
+            finally:
+                kernel32.CloseHandle(handle)
+        except (OSError, AttributeError):
+            return True
+
+    from gateway.status import _posix_is_zombie
+    if _posix_is_zombie(pid):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
     return True
 
 
@@ -412,6 +436,37 @@ def heartbeat_worker(
             run_id=run_id,
         )
     return True
+
+
+def finalize_requested_worker_blocks(conn: sqlite3.Connection) -> list[str]:
+    """Finalize exact host-local ``blocking`` attempts whose workers are dead.
+
+    A live, foreign-host, or incomplete tuple retains its claim for a later
+    tick.  The kernel helper repeats the full run/PID/claim CAS inside its write
+    transaction, so a stale observation cannot finalize a successor attempt.
+    """
+    finalized: list[str] = []
+    rows = conn.execute(
+        "SELECT id, current_run_id, worker_pid, claim_lock FROM tasks "
+        "WHERE status = 'blocking'"
+    ).fetchall()
+    host_prefix = _kb._host_prefix()
+    for row in rows:
+        run_id = row["current_run_id"]
+        pid = row["worker_pid"]
+        claim_lock = row["claim_lock"]
+        if run_id is None or pid is None or not claim_lock:
+            continue
+        if not str(claim_lock).startswith(host_prefix):
+            continue
+        if _kb._pid_alive(int(pid)):
+            continue
+        if _kb.finalize_worker_block(
+            conn, row["id"], expected_run_id=int(run_id),
+            expected_worker_pid=int(pid), expected_claim_lock=str(claim_lock),
+        ):
+            finalized.append(row["id"])
+    return finalized
 
 
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
@@ -1343,16 +1398,16 @@ def configured_max_in_progress() -> Optional[int]:
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:
-    """Number of tasks in ``status='running'``.
+    """Number of attempts occupying worker capacity.
 
-    Used by the multi-board sweep to count OTHER boards' workers against the
-    host-level budget — the memory-derived cap bounds the machine, not the
-    board. Fails open to 0 so a broken board doesn't brick dispatch on healthy ones.
+    Both ``running`` and Phase-1 ``blocking`` rows own a potentially live worker.
+    Used by the multi-board sweep to count OTHER boards against the host-level
+    budget. Fails open to 0 so a broken board doesn't brick healthy dispatch.
     """
     try:
         return int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                "SELECT COUNT(*) FROM tasks WHERE status IN ('running', 'blocking')"
             ).fetchone()[0]
         )
     except Exception:
@@ -1360,7 +1415,7 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
 
 
 def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
-    """Total ``running`` tasks across every board EXCEPT ``board``.
+    """Total capacity-occupying attempts across every board EXCEPT ``board``.
 
     Caps bound the HOST, but each board's tick only sees its own DB; without
     this a derived cap of N gets multiplied by the number of active boards.
@@ -1634,6 +1689,7 @@ def _run_reclaim_phase(
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
+    finalize_requested_worker_blocks(conn)
     result.reclaimed = _kb.release_stale_claims(conn)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
@@ -1803,7 +1859,7 @@ def _dispatch_once_locked(
     if per_profile_cap is not None:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "WHERE status IN ('running', 'blocking') AND assignee IS NOT NULL "
             "GROUP BY assignee"
         ):
             per_profile_running[prow["assignee"]] = int(prow["n"])
