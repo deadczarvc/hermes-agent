@@ -207,26 +207,40 @@ To keep the 85% autoraise but hide only the one-time notice:
 hermes config set compression.codex_gpt55_autoraise_notice false
 ```
 
-### Codex large-context `-900k` picker variants (opt-in)
+### Codex documented 1.05M models and legacy `-900k` aliases
 
-The ChatGPT Codex backend *advertises* a 272K window for the gpt-5.4 and
-gpt-5.6 (Sol/Terra/Luna) families, but actually accepts ~911K input tokens
-for ChatGPT-subscription accounts (live-verified Aug 2026). Hermes keeps the
-**advertised 272K as the default** for the base slugs — a bigger window means
-more tokens per request and much faster subscription-usage burn, so the large
-window is strictly opt-in.
+OpenAI documents a **1,050,000-token context window** and **128,000 maximum
+output tokens** for `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, and
+`gpt-5.6-luna`. Hermes therefore uses those exact base slugs at the documented
+window on the ChatGPT Codex OAuth route. The account-scoped Codex catalog can
+lag a staged rollout and still advertise 272K; Hermes corrects that stale value
+only for these four exact model ids. Unknown descendants and `-pro` guesses are
+not promoted.
 
-To use the large window, pick the explicit `-900k` variant in `/model` (e.g.
-`gpt-5.6-sol-900k`, `gpt-5.6-terra-900k`, `gpt-5.6-luna-900k`,
-`gpt-5.4-900k`). These are Hermes-side aliases: the suffix is stripped before
-the model id is sent to the backend, and pricing/usage accounting treats them
-as the base model. Slugs that genuinely enforce 272K (gpt-5.5, gpt-5.4-mini)
-have no `-900k` variant.
+For these routes, an explicit
+`model_overrides.openai-codex.<model>.max_output_tokens` becomes the local
+request budget and compressor output reservation. It is applied at initial
+agent creation, recomputed on an in-place model switch, and persisted in Desktop
+session metadata for resume. The precedence is `HERMES_MAX_TOKENS` > explicit
+per-model override > global `model.max_tokens` > provider default. A switch to a
+route without an explicit per-model override therefore returns to its
+global/provider cap rather than retaining the previous model's 128K budget.
 
-Compaction thresholds follow the window: base slugs (272K) get the **85%
-autoraise** described above, while `-900k` variants keep your global
-`compression.threshold` (default 50%, ~450K) — the autoraise exists to stop
-wasting a small window, which a 900K window doesn't need.
+The ChatGPT Codex subscription endpoint does not accept a wire
+`max_output_tokens` parameter, so Hermes omits it there; the 128K value remains
+local budget/reservation metadata and server-side generation enforcement is not
+configurable or known on that endpoint. Supported Responses endpoints transmit
+`max_output_tokens: 128000`.
+
+The older `-900k` picker aliases remain accepted for backward compatibility.
+They still resolve to a 900K safety window and strip the suffix before the
+model id is sent to the backend. Slugs that genuinely enforce 272K (including
+`gpt-5.5` and `gpt-5.4-mini`) do not gain a documented full-window override.
+
+Compaction thresholds follow the resolved window. The four documented base
+slugs use the global `compression.threshold`; a legacy `-900k` alias keeps its
+900K window. The gpt-5.5-specific 85% autoraise remains limited to its intended
+272K route.
 
 ### Codex app-server thread compaction
 

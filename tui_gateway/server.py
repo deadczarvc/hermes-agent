@@ -1455,6 +1455,28 @@ def _parse_model_config(raw, *, quiet: bool = False) -> dict:
     return {}
 
 
+def _restored_model_max_tokens(provider: str, model: str, stored) -> int | None:
+    """Re-evaluate derived session metadata against the current output-cap policy."""
+    raw_env = os.environ.get("HERMES_MAX_TOKENS")
+    if raw_env:
+        with contextlib.suppress(TypeError, ValueError):
+            value = int(raw_env)
+            if value > 0:
+                return value
+
+    cfg = _load_cfg()
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    global_cap = model_cfg.get("max_tokens") if isinstance(model_cfg, dict) else None
+    configured = global_cap if isinstance(global_cap, int) and not isinstance(global_cap, bool) and global_cap > 0 else None
+    with contextlib.suppress(Exception):
+        from agent.models_dev import resolve_model_max_output_tokens
+
+        resolved = resolve_model_max_output_tokens(provider, model, configured)
+        if resolved is not None:
+            return resolved
+    return stored if isinstance(stored, int) and not isinstance(stored, bool) and stored > 0 else None
+
+
 def _stored_session_runtime_overrides(row: dict | None) -> dict:
     """Runtime fields persisted with a stored session (model column, ``billing_provider``, JSON ``model_config``):
     resume restores the model/provider/reasoning THAT chat used, not the global pick. Plugin-owned Bot-Mode
@@ -1478,6 +1500,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     if not provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS:
         provider = billing_provider
     base_url, api_mode, service_tier = field("base_url"), field("api_mode"), field("service_tier")
+    stored_max_tokens = model_config.get("max_tokens")
     reasoning_config = model_config.get("reasoning_config")
     # Heal a stale provider persisted by an older build (renamed/removed custom provider → "Unknown provider"):
     # recover ``custom:<name>`` from the stored base_url, then from the entry serving the model; else drop it.
@@ -1494,11 +1517,15 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             base_url = ""  # the healed identity owns a registered endpoint; the snapshot URL must not override it
         else:
             provider = ""
+    max_tokens = _restored_model_max_tokens(provider, model, stored_max_tokens)
     if model:
         # Same dict-shaped override live /model switches use, so a DB-restored session keeps custom endpoint
         # metadata across resume and rebuilds (/new). Raw api_key is never persisted/restored.
         overrides["model_override"] = {
-            "model": model, "provider": provider or None, "base_url": base_url or None, "api_mode": api_mode or None}
+            "model": model, "provider": provider or None, "base_url": base_url or None,
+            "api_mode": api_mode or None,
+            "max_tokens": max_tokens if isinstance(max_tokens, int) and max_tokens > 0 else None,
+        }
     if provider:
         overrides["provider_override"] = provider
     if isinstance(reasoning_config, dict):
@@ -1526,6 +1553,7 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     reasoning_config = getattr(agent, "reasoning_config", None)
     live = {
         "model": model, "provider": provider, "base_url": base_url, "api_mode": attr("api_mode"),
+        "max_tokens": getattr(agent, "max_tokens", None),
         # An empty dict is still a real (present) reasoning config.
         "reasoning_config": reasoning_config if isinstance(reasoning_config, dict) else None,
         "service_tier": getattr(agent, "service_tier", None),
@@ -2217,7 +2245,7 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
                 # Failing identity recovery, still hand base_url to the direct-alias branch so pool/env credentials resolve.
                 resolve_kwargs["explicit_base_url"] = override_base_url
         resolve_kwargs.update(requested=requested_provider, target_model=model or None)
-        overrides = {k: model_override.get(k) for k in ("base_url", "api_key", "api_mode")}
+        overrides = {k: model_override.get(k) for k in ("base_url", "api_key", "api_mode", "max_tokens")}
     else:
         model, requested_provider = _resolve_startup_runtime()
         if isinstance(model_override, str) and model_override:
@@ -2231,7 +2259,7 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
         if not resolution.selected_model:
             raise RuntimeError("Auth fallback resolved without a model")
         return resolution.selected_model, resolution.runtime
-    resolution.runtime.update({k: v for k, v in overrides.items() if v})
+    resolution.runtime.update({k: v for k, v in overrides.items() if v is not None})
     return model, resolution.runtime
 
 
@@ -2280,6 +2308,7 @@ def _make_agent(
     ignore_rules = is_truthy_value(os.environ.get("HERMES_IGNORE_RULES"))
     agent = AIAgent(
         model=model, max_iterations=_cfg_max_turns(cfg, 500), provider=runtime.get("provider"),
+        max_tokens=runtime.get("max_tokens"),
         base_url=runtime.get("base_url"), api_key=runtime.get("api_key"), api_mode=runtime.get("api_mode"),
         acp_command=runtime.get("command"), acp_args=runtime.get("args"),
         credential_pool=runtime.get("credential_pool"), quiet_mode=True,
