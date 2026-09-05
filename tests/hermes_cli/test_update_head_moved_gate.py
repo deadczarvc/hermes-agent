@@ -13,9 +13,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli import main as hermes_main
-import hermes_cli.main_web_build as main_web_build
 import hermes_cli.main_install_repair as main_install_repair
+import hermes_cli.main_web_build as main_web_build
+from hermes_cli import main as hermes_main
 from hermes_cli import update_cmd
 
 
@@ -103,6 +103,9 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     )
     monkeypatch.setattr(
         hermes_main, "_pause_windows_gateways_for_update", lambda: None
+    )
+    monkeypatch.setattr(
+        hermes_main, "_purge_stale_hermes_modules", lambda *a, **k: None
     )
     monkeypatch.setattr(
         hermes_main, "_resume_windows_gateways_after_update", lambda *a, **k: None
