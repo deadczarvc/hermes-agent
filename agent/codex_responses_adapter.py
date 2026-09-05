@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Ty
 
 from agent.message_sanitization import deterministic_call_id
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from agent.reasoning_effort import CODEX_ASTRA_EFFORTS
 
 logger = logging.getLogger(__name__)
 
@@ -281,14 +282,31 @@ def _derive_responses_function_call_id(call_id: str, response_item_id: Optional[
 
 def _responses_tools(tools: Optional[List[Dict[str, Any]]] = None) -> Optional[List[Dict[str, Any]]]:
     """Convert chat-completions tool schemas to Responses function-tool schemas."""
-    fns = [item.get("function", {}) if isinstance(item, dict) else {} for item in tools or []]
-    converted = [
-        {
+    converted: List[Dict[str, Any]] = []
+    for idx, item in enumerate(tools or []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "custom":
+            raise ValueError(
+                f"Codex Responses tools[{idx}] custom tool lifecycle is unsupported; "
+                "Hermes cannot round-trip custom_tool_call_output yet."
+            )
+        fn = item.get("function", {})
+        if not isinstance(fn, dict) or not _nonblank(fn.get("name")):
+            continue
+        async_values = [value for value in (item.get("async"), fn.get("async")) if value is not None]
+        if any(value is True for value in async_values):
+            raise ValueError(
+                f"Codex Responses tools[{idx}] async tool lifecycle is unsupported; "
+                "Hermes has no durable async result executor."
+            )
+        if any(not isinstance(value, bool) for value in async_values):
+            raise ValueError(f"Codex Responses tools[{idx}].async must be a boolean.")
+        tool = {
             "type": "function", "name": fn["name"], "description": fn.get("description", ""), "strict": False,
             "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
         }
-        for fn in fns if _nonblank(fn.get("name"))
-    ]
+        converted.append(tool)
     return converted or None
 
 
@@ -713,8 +731,21 @@ def _preflight_tool(tool: Any, idx: int) -> Dict[str, Any]:
     if not isinstance(tool, dict):
         raise ValueError(f"Codex Responses tools[{idx}] must be an object.")
     tool_type = tool.get("type")
+    async_value = tool.get("async")
+    if async_value is True:
+        raise ValueError(
+            f"Codex Responses tools[{idx}] async tool lifecycle is unsupported; "
+            "Hermes has no durable async result executor."
+        )
+    if "async" in tool and not isinstance(async_value, bool):
+        raise ValueError(f"Codex Responses tools[{idx}].async must be a boolean.")
     if tool_type in _RESPONSES_BUILTIN_TOOL_TYPES:  # provider-executed built-ins carry no name/parameters
         return dict(tool)
+    if tool_type == "custom":
+        raise ValueError(
+            f"Codex Responses tools[{idx}] custom tool lifecycle is unsupported; "
+            "Hermes cannot round-trip custom_tool_call_output yet."
+        )
     if tool_type != "function":
         raise ValueError(f"Codex Responses tools[{idx}] has unsupported type {tool.get('type')!r}.")
     name, parameters = tool.get("name"), tool.get("parameters")
@@ -758,6 +789,38 @@ def _optional_dict(api_kwargs: Dict[str, Any], key: str) -> Optional[Dict[str, A
     return value
 
 
+def _validate_astra_api_kwargs(api_kwargs: Dict[str, Any], model: str) -> None:
+    """Fail closed on Astra violations at the final preflight boundary."""
+    if model.strip().lower() != "gpt-6-astra":
+        return
+    violations: List[str] = []
+    if model != "gpt-6-astra":
+        violations.append("model must be exactly 'gpt-6-astra'")
+    containers = [("", api_kwargs)]
+    if isinstance(api_kwargs.get("extra_body"), dict):
+        containers.append(("extra_body.", api_kwargs["extra_body"]))
+    for prefix, container in containers:
+        if "model" in container and container["model"] != "gpt-6-astra":
+            violations.append(f"{prefix}model must be exactly 'gpt-6-astra'")
+        violations.extend(
+            f"{prefix}{field}" for field in ("temperature", "top_p", "top_logprobs") if field in container
+        )
+        reasoning = container.get("reasoning")
+        if reasoning is not None:
+            if not isinstance(reasoning, dict):
+                violations.append(f"{prefix}reasoning must be an object")
+            elif "effort" in reasoning and reasoning["effort"] not in CODEX_ASTRA_EFFORTS:
+                violations.append(f"{prefix}reasoning.effort must be one of low, medium, high, xhigh, max")
+        include = container.get("include")
+        if include is not None:
+            if not isinstance(include, list) or any(not isinstance(item, str) for item in include):
+                violations.append(f"{prefix}include must be an array of strings")
+            elif "message.output_text.logprobs" in include:
+                violations.append(f"{prefix}include contains forbidden message.output_text.logprobs")
+    if violations:
+        raise ValueError("GPT-6 Astra request contract violation: " + "; ".join(violations))
+
+
 def _preflight_codex_api_kwargs(
     api_kwargs: Any, *, allow_stream: bool = False, is_github_responses: bool = False,
     sanitize_harmony_tokens: bool = False,
@@ -769,6 +832,7 @@ def _preflight_codex_api_kwargs(
     model = api_kwargs.get("model")
     if not _nonblank(model):
         raise ValueError("Codex Responses request 'model' must be a non-empty string.")
+    _validate_astra_api_kwargs(api_kwargs, model)
     instructions = _str_or_empty(api_kwargs.get("instructions")).strip() or DEFAULT_AGENT_IDENTITY
     if sanitize_harmony_tokens:
         instructions = _neutralize_harmony_tokens(instructions)
