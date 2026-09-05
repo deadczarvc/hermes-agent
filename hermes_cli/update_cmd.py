@@ -1164,6 +1164,48 @@ def _finish_already_up_to_date(
         sys.exit(1)
 
 
+def _recover_update_wipe_after_pull() -> None:
+    """Run the existing surgical recovery before consumers load the updated checkout.
+
+    Match session-init's opt-out and fail-open policy: unknown local anchors must
+    not brick upstream updates, but failures must remain visible in the receipt.
+    """
+    import json
+
+    step = "update_wipe_recovery"
+    if os.environ.get("UPDATE_WIPE_RECOVERY_DISABLE") == "1":
+        _record_update_step(step, True, "skipped: UPDATE_WIPE_RECOVERY_DISABLE=1")
+        return
+    try:
+        script = Path(os.environ.get(
+            "UPDATE_WIPE_RECOVERY_SCRIPT",
+            str(Path.home() / "AppData/Local/hermes/skills/hermes-internal/"
+                "update-wipe-recovery/scripts/recover.py")))
+        if not script.is_file():
+            _record_update_step(step, True, "skipped: recovery script not installed")
+            return
+        # Always repair THIS transaction's checkout, not a session-hook repo override.
+        proc = subprocess.run(
+            [sys.executable, str(script), "--repo", str(_m().PROJECT_ROOT), "--apply", "--json"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8",
+            timeout=30, creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                      | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)))
+        payload = json.loads(proc.stdout)
+        changed = int(payload["changed"])
+        errors, missing = payload["errors"], payload["missing"]
+        ok = proc.returncode == 0 and not errors and not missing
+        # Do not persist arbitrary subprocess output (or potentially sensitive source excerpts).
+        detail = f"rc={proc.returncode}; changed={changed}; errors={len(errors)}; missing={len(missing)}"
+    except Exception as exc:
+        ok, changed = False, 0
+        detail = f"recovery failed: {type(exc).__name__}"
+    _record_update_step(step, ok, detail)
+    if not ok:
+        print(f"⚠ Local update-wipe recovery advisory: {detail}. Continuing upstream update.")
+    elif changed:
+        print(f"  ✓ Restored {changed} local artifacts before restart.")
+
+
 def _apply_pulled_update(
     git_cmd, branch, pre_pull_sha, _plan, opts, *, gateway_mode, is_fork, desktop_dir,
     had_desktop_app_before_update, pre_update_snapshot_id, _pre_update_plan,
@@ -1185,6 +1227,9 @@ def _apply_pulled_update(
     if is_fork and branch == "main":
         _m()._sync_with_upstream_if_needed(
             git_cmd, _m().PROJECT_ROOT, assume_yes=opts.assume_yes, input_fn=opts.gw_input_fn)
+
+    # Pull/reset, stash settlement, and optional upstream sync have all finished mutating code.
+    _recover_update_wipe_after_pull()
 
     # .[all], falling back to base + extras individually so one broken extra doesn't strip
     # the rest; the ownership preflight refuses first on foreign-owned (sudo-pip) venv files.
