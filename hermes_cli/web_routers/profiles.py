@@ -572,7 +572,7 @@ def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000
     scoped_session_ids: List[str] = []
     errors: List[Dict[str, str]] = []
 
-    for name, home in _profile_targets("GET /api/profiles/projects/tree", lightweight=False):
+    for name, home in _profile_targets("GET /api/profiles/projects/tree", lightweight=True):
         def _read(db, name=name, home=home):
             with _hermes_home_scope(home):
                 tree, _active_id = gateway_server._build_project_tree(

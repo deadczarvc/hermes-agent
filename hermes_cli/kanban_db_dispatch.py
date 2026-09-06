@@ -162,29 +162,43 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
+def _decode_worker_exit(raw_status: int) -> "tuple[str, Optional[int]]":
+    """Decode POSIX wait status and Windows-compatible test/status values."""
+    if hasattr(os, "WIFEXITED"):
+        try:
+            if os.WIFEXITED(raw_status):
+                code = os.WEXITSTATUS(raw_status)
+                if code == 0:
+                    return ("clean_exit", 0)
+                if code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
+                    return ("rate_limited", code)
+                return ("nonzero_exit", code)
+            if os.WIFSIGNALED(raw_status):
+                return ("signaled", os.WTERMSIG(raw_status))
+        except (AttributeError, TypeError, ValueError):
+            return ("unknown", None)
+        return ("unknown", None)
+
+    # Windows has no os.waitpid/WIF* API. The test and future reap bridge use
+    # POSIX-shaped statuses (exit_code << 8); accept native direct codes too.
+    code = int(raw_status)
+    if code < 0:
+        return ("signaled", -code)
+    if code > 0xFF and code & 0xFF == 0:
+        code >>= 8
+    if code == 0:
+        return ("clean_exit", 0)
+    if code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
+        return ("rate_limited", code)
+    return ("nonzero_exit", code)
+
+
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
-    """``(kind, code)`` for a reaped worker PID: ``clean_exit`` (rc 0 while
-    still ``running`` = protocol violation), ``rate_limited``
-    (``KANBAN_RATE_LIMIT_EXIT_CODE``, never counts as a failure),
-    ``nonzero_exit``, ``signaled`` (``code`` is the signal), ``unknown`` (pid
-    not in the reap registry; ``code`` None)."""
+    """``(kind, code)`` for a reaped worker PID."""
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
-    raw, _ = entry
-    try:
-        if os.WIFEXITED(raw):
-            code = os.WEXITSTATUS(raw)
-            if code == 0:
-                return ("clean_exit", 0)
-            if code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
-                return ("rate_limited", code)
-            return ("nonzero_exit", code)
-        if os.WIFSIGNALED(raw):
-            return ("signaled", os.WTERMSIG(raw))
-    except Exception:
-        pass
-    return ("unknown", None)
+    return _decode_worker_exit(entry[0])
 
 
 def reap_worker_zombies() -> "list[int]":

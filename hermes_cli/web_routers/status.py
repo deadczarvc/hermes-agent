@@ -5,18 +5,18 @@ Extracted from ``hermes_cli.web_server``; app state and helpers are late-bound t
 :mod:`hermes_cli.web_deps` (cycle-safe, monkeypatch-friendly).
 """
 
+import anyio
+import asyncio
 import concurrent.futures
 import importlib
 import logging
-import re
-import asyncio
 import os
+import re
 import sys
 import time
 from fastapi import APIRouter
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_server_gateway import _display_system_platform
-from starlette.concurrency import run_in_threadpool
 from fastapi import HTTPException, Request
 from gateway.status import derive_gateway_busy, derive_gateway_drainable, normalize_updated_at, parse_active_agents, resolve_gateway_liveness
 from hermes_cli import __version__, __release_date__
@@ -55,6 +55,16 @@ _open_session_db_for_profile = late("_open_session_db_for_profile", "hermes_cli.
 
 _STATUS_ACTIVE_SESSIONS_TIMEOUT = 0.75
 _GATEWAY_HEALTH_ROUTE_TIMEOUT = 1.0
+_STATUS_THREAD_LIMITER = anyio.CapacityLimiter(4)
+
+
+async def _run_status_in_threadpool(fn, *args):
+    """Run status I/O outside the shared profile-read limiter."""
+    return await anyio.to_thread.run_sync(
+        fn, *args, abandon_on_cancel=True, limiter=_STATUS_THREAD_LIMITER
+    )
+
+
 _HEALTHY_PLATFORM_STATES = {"connected", "running", "ok"}
 
 
@@ -87,7 +97,7 @@ def _count_status_active_sessions() -> int:
 async def _status_active_sessions() -> int:
     try:
         return await asyncio.wait_for(
-            run_in_threadpool(_count_status_active_sessions),
+            _run_status_in_threadpool(_count_status_active_sessions),
             timeout=_STATUS_ACTIVE_SESSIONS_TIMEOUT)
     except asyncio.TimeoutError:
         _log.debug("/api/status active session count exceeded %.2fs; returning 0",
@@ -189,16 +199,21 @@ def _bounded_health_probe():
     """Health probe with the route's blocking-call budget preserved. The resolver only
     reaches this rung when the local PID probe came up empty, so the timeout is paid at
     most once per request and only in the cross-container case that needs it."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_probe_gateway_health)
-        try:
-            return future.result(timeout=_GATEWAY_HEALTH_ROUTE_TIMEOUT)
-        except concurrent.futures.TimeoutError:
-            _log.warning("/api/status gateway health probe exceeded %.2fs; using local status",
-                         _GATEWAY_HEALTH_ROUTE_TIMEOUT)
-            return False, None
-        except Exception:
-            return False, None
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(_probe_gateway_health)
+    try:
+        return future.result(timeout=_GATEWAY_HEALTH_ROUTE_TIMEOUT)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        _log.warning("/api/status gateway health probe exceeded %.2fs; using local status",
+                     _GATEWAY_HEALTH_ROUTE_TIMEOUT)
+        pool.shutdown(wait=False, cancel_futures=True)
+        return False, None
+    except Exception:
+        pool.shutdown(wait=False, cancel_futures=True)
+        return False, None
+    else:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _project_gateway_platforms(gateway_platforms: dict, configured: "set[str] | None",
@@ -232,7 +247,7 @@ async def _resolve_gateway_status(profile_dir: Optional[Path], health_url) -> Di
     """
     local_runtime = (read_runtime_status(path=profile_dir / "gateway_state.json")
                      if profile_dir else read_runtime_status())
-    liveness = await run_in_threadpool(lambda: resolve_gateway_liveness(
+    liveness = await _run_status_in_threadpool(lambda: resolve_gateway_liveness(
         profile_dir=profile_dir, runtime=local_runtime,
         health_probe=_bounded_health_probe if health_url else None,
         pid_probe=get_running_pid_cached, runtime_reader=read_runtime_status,
@@ -241,7 +256,7 @@ async def _resolve_gateway_status(profile_dir: Optional[Path], health_url) -> Di
     remote_health_body: dict | None = liveness.health_body
 
     try:
-        configured = await run_in_threadpool(_load_configured_gateway_platforms)
+        configured = await _run_status_in_threadpool(_load_configured_gateway_platforms)
     except Exception:
         configured = None
 
@@ -332,7 +347,7 @@ async def _component_health(gateway: Dict[str, Any]) -> Dict[str, Any]:
         "dashboard": DASHBOARD_HEALTH.snapshot()}
     try:
         from gateway.readiness import _probe_state_db
-        storage_check = await run_in_threadpool(_probe_state_db, get_hermes_home())
+        storage_check = await _run_status_in_threadpool(_probe_state_db, get_hermes_home())
         components["storage"] = {"status": storage_check.get("status", "degraded")}
     except Exception:
         components["storage"] = {"status": "degraded"}
@@ -354,7 +369,7 @@ async def _advisory_pressure(status: Dict[str, Any], home: Path) -> None:
                                    ("disk", "gateway.disk_status", "collect_disk_status")):
         try:
             collect = getattr(importlib.import_module(mod_name), fn_name)
-            status[key] = await run_in_threadpool(collect, home)
+            status[key] = await _run_status_in_threadpool(collect, home)
         except Exception:
             status[key] = {"pressure": "unknown"}
 
@@ -400,7 +415,7 @@ async def get_status(profile: Optional[str] = None):
         # Topology (cached, TTL 10s) is fetched before the platform rollup so per-profile
         # gateway failures fold into the machine-level view (see
         # _merge_profile_gateway_platforms); a ``?profile=`` request is left unmerged.
-        topology = await run_in_threadpool(_collect_profile_gateway_topology_cached)
+        topology = await _run_status_in_threadpool(_collect_profile_gateway_topology_cached)
         if not requested_profile:
             gateway["gateway_platforms"] = _merge_profile_gateway_platforms(
                 gateway["gateway_platforms"], topology.get("profile_platforms") or {})
@@ -413,7 +428,7 @@ async def get_status(profile: Optional[str] = None):
         active_agents = parse_active_agents((gateway["runtime"] or {}).get("active_agents", 0))
         # Off-loop: on a cold Windows install the first import of hermes_cli.gateway blocks
         # 15-30s (.pyc compilation + Defender), exceeding the desktop handshake's 15s timeout.
-        restart_drain_timeout = await run_in_threadpool(_resolve_restart_drain_timeout)
+        restart_drain_timeout = await _run_status_in_threadpool(_resolve_restart_drain_timeout)
         auth = _auth_gate_status()
 
         status = {
@@ -435,7 +450,7 @@ async def get_status(profile: Optional[str] = None):
 
         # Stable per-install identity (first call may touch disk). Omitted (not null) when
         # unpersistable so older-client behavior and the no-identity fallback stay identical.
-        install_id = await run_in_threadpool(get_install_id)
+        install_id = await _run_status_in_threadpool(get_install_id)
         if install_id:
             status["install_id"] = install_id
 

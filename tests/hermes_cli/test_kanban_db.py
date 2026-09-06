@@ -571,7 +571,12 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    listed_paths = {
+        line.removeprefix("worktree ").replace("\\", "/").casefold()
+        for line in listed.splitlines()
+        if line.startswith("worktree ")
+    }
+    assert str(target).replace("\\", "/").casefold() in listed_paths
     assert f"branch refs/heads/{branch}" in listed
 
 
@@ -1182,7 +1187,7 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeypatch):
+def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeypatch, tmp_path):
     """When the shim is not on PATH, fall back to `python -m hermes_cli.main`.
 
     Pins the correct module name (NOT `hermes` — there is no top-level
@@ -1190,13 +1195,11 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
     `python -m hermes` which fails with `No module named hermes` on every
     invocation.
     """
-    import shutil
-    import sys
     import hermes_cli.kanban_db as kb
     from hermes_cli import kanban_db_dispatch as kbd
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
-    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setenv("PATH", str(tmp_path))
     argv = kbd._resolve_hermes_argv()
     assert argv == [sys.executable, "-m", "hermes_cli.main"]
 
