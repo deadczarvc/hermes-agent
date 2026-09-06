@@ -1978,7 +1978,11 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
         "ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if row is not None:
+        return row["kind"] == "blocked"
+    # Creation-time parking is explicit intent, unlike a legacy/breaker block.
+    created = _latest_event(conn, task_id, "created")
+    return _json_dict(_row_get(created, "payload")).get("status") == "blocked"
 
 
 def _latest_event(

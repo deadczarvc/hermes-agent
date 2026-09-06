@@ -131,6 +131,10 @@ _DESKTOP_MCP_DISCOVERY_DELAY_S = 1.0
 
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
+    # Desktop serve bypasses CLI chat startup; configured guards must register here.
+    from agent.shell_hooks import register_from_config
+
+    register_from_config(load_config())
     app.state.event_channels = {}  # dict[str, set]
     app.state.event_lock = asyncio.Lock()
     app.state.pty_active_session_files = {}  # dict[str, Path]
