@@ -3186,18 +3186,36 @@ async function checkUpdates() {
     // flagging that as an update nudges the user into wiping their work.
     const tipsEqual = Boolean(currentSha && currentSha === targetSha)
 
-    const sshBehind = tipsEqual
-      ? 0
-      : await fetchCompareBehindCount({ currentSha, originUrl: OFFICIAL_REPO_HTTPS_URL, targetSha })
+    // Prefer the local graph before the GitHub compare fallback. A 403/rate-limit
+    // from compare.github.com must not turn a local-ahead checkout into a false
+    // `(update)` badge: refresh origin/<branch>, then use its exact local count.
+    let targetIsAncestorOfHead = false
+    let localBehind: number | null = null
 
-    const upToDate = tipsEqual || sshBehind === 0
+    if (!tipsEqual) {
+      const refreshed = await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
+
+      if (refreshed.code === 0) {
+        const localCount = await runGit(['rev-list', `HEAD..origin/${branch}`, '--count'], { cwd: updateRoot })
+        const parsed = Number.parseInt(localCount.stdout.trim(), 10)
+        localBehind = Number.isInteger(parsed) && parsed >= 0 ? parsed : null
+        targetIsAncestorOfHead =
+          (await runGit(['merge-base', '--is-ancestor', `origin/${branch}`, 'HEAD'], { cwd: updateRoot })).code === 0
+      }
+    }
+
+    const sshBehind = tipsEqual || targetIsAncestorOfHead
+      ? 0
+      : localBehind ?? await fetchCompareBehindCount({ currentSha, originUrl: OFFICIAL_REPO_HTTPS_URL, targetSha })
+
+    const upToDate = tipsEqual || targetIsAncestorOfHead || sshBehind === 0
 
     return {
       supported: true,
       branch,
       currentBranch,
       behind: upToDate ? 0 : sshBehind,
-      updateAvailable: !upToDate,
+      updateAvailable: !upToDate && sshBehind !== null,
       currentSha,
       targetSha,
       commits: [],
