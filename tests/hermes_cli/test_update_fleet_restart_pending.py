@@ -299,6 +299,33 @@ def test_successful_command_boundary_receipt_without_fleet_does_not_retrigger(
     assert update_cmd._pending_fleet_restart_needed() is False
 
 
+def test_successful_receipt_superseded_by_later_checkout_does_not_retrigger(
+    monkeypatch,
+):
+    """A later commit supersedes a completed receipt's old fleet matrix."""
+    disk_sha = "n" * 40
+    receipt_sha = "o" * 40
+    monkeypatch.setattr(update_cmd, "_current_checkout_sha", lambda: disk_sha)
+    monkeypatch.setattr(update_cmd_fleet, "_current_checkout_sha", lambda: disk_sha)
+
+    receipt_dir = get_hermes_home() / "logs" / "update_receipts"
+    receipt_dir.mkdir(parents=True)
+    (receipt_dir / "latest.json").write_text(
+        json.dumps(
+            {
+                "exit_code": 0,
+                "outcome": "success",
+                "post_update": {"sha": receipt_sha},
+                "fleet": [{"profile": "default", "code_sha": receipt_sha, "state": "current"}],
+                "gateway_restart": {"incomplete": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert update_cmd._pending_fleet_restart_needed() is False
+
+
 @pytest.mark.parametrize(
     ("receipt", "unfinished"),
     [

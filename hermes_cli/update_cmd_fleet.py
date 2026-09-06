@@ -120,6 +120,19 @@ def _receipt_reports_stale_runtime(expected_sha: str | None = None) -> bool:
     if not expected_sha:
         return False
 
+    # A successful receipt can outlive the checkout it describes: a later local
+    # commit (or another completed update) supersedes its fleet matrix. Do not
+    # resurrect a restart warning from that historical receipt. Unfinished
+    # receipts still flow through the conservative plan/runtime checks below.
+    post_update = receipt.get("post_update")
+    if (
+        not _receipt_looks_unfinished(receipt)
+        and isinstance(post_update, dict)
+        and post_update.get("sha")
+        and str(post_update["sha"]) != str(expected_sha)
+    ):
+        return False
+
     def _sha_mismatch(code_sha) -> bool:
         return bool(code_sha) and str(code_sha) != str(expected_sha)
 
