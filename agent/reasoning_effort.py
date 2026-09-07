@@ -27,9 +27,10 @@ EFFORT_LADDER: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "x
 #: Widest OpenAI-compatible wire vocabulary (OpenRouter, Nous Portal).
 OPENAI_COMPAT_WIRE_EFFORTS: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
-#: OpenAI/Codex Responses per model generation (live-verified): ``minimal`` is rejected by
-#: both (clamps to low); ``max`` is gpt-5.6-only.
+#: OpenAI/Codex Responses per model generation. GPT-6 Astra has its own documented
+#: vocabulary: ``none``/``minimal`` are invalid final-wire values and ``max`` is valid.
 CODEX_GPT56_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
+CODEX_ASTRA_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 CODEX_LEGACY_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh")
 
 #: xAI Responses — Grok 4.6+ accepts xhigh; older Grok tops out at high.
@@ -80,7 +81,10 @@ META_AI_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh")
 
 def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """Supported effort set for an OpenAI/Codex Responses model."""
-    return CODEX_GPT56_EFFORTS if "gpt-5.6" in (model or "").lower() else CODEX_LEGACY_EFFORTS
+    normalized = (model or "").strip().lower()
+    if normalized == "gpt-6-astra":
+        return CODEX_ASTRA_EFFORTS
+    return CODEX_GPT56_EFFORTS if "gpt-5.6" in normalized else CODEX_LEGACY_EFFORTS
 
 
 def kimi_supported_efforts(model: Optional[str]) -> tuple[str, ...]:

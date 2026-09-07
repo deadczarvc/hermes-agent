@@ -11,9 +11,8 @@ import re
 from typing import Any, Callable, Optional
 
 from agent.reasoning_effort import (
-    ACTUAL_RELAY_EFFORTS, XAI_GROK46_EFFORTS, XAI_LEGACY_EFFORTS, clamp_effort,
-    # Same declared vocabulary + shared clamp as the main Codex transport (agent.reasoning_effort):
-    # per-model — "max" is gpt-5.6-only, "minimal"/"ultra" always rejected (live-verified, #68365).
+    ACTUAL_RELAY_EFFORTS, CODEX_ASTRA_EFFORTS, XAI_GROK46_EFFORTS, XAI_LEGACY_EFFORTS, clamp_effort,
+    # Same declared vocabulary + shared clamp as the main Codex transport (agent.reasoning_effort).
     codex_supported_efforts,
 )
 from agent.transports.base import ProviderTransport
@@ -211,11 +210,22 @@ def _resolve_reasoning(model: str, params: dict[str, Any]) -> tuple[Any, bool]:
         elif reasoning_config.get("effort"):
             reasoning_effort = reasoning_config["effort"]
 
+    is_astra = str(model or "").strip().lower() == "gpt-6-astra"
+    if is_astra and reasoning_enabled and isinstance(reasoning_config, dict) and "effort" in reasoning_config:
+        requested = reasoning_config["effort"]
+        if not isinstance(requested, str) or requested not in CODEX_ASTRA_EFFORTS:
+            raise ValueError(
+                "GPT-6 Astra reasoning effort must be exactly one of low, medium, high, xhigh, max; "
+                "none/minimal migration requires an explicit migration step."
+            )
+
     # Wire vocabularies are declared in agent.reasoning_effort; the shared clamp policy (nearest weaker
     # supported level, never escalate, never invert the ladder) replaces the per-backend hand maps that
     # repeatedly leaked internal levels like "ultra" to the wire (#89503 class) or clamped one rung below a
     # model's real ceiling (#87279).
-    if params.get("is_xai_responses", False):
+    if is_astra:
+        supported = CODEX_ASTRA_EFFORTS
+    elif params.get("is_xai_responses", False):
         from agent.model_metadata import is_grok_46_family
 
         # Grok 4.6 accepts xhigh; older Grok tops out at high.
@@ -543,6 +553,15 @@ class ResponsesApiTransport(ProviderTransport):
         ))
         if params.get("request_overrides"):
             kwargs.update(params["request_overrides"])
+        override_body = kwargs.get("extra_body")
+        if is_codex_backend and (
+            "max_output_tokens" in kwargs
+            or isinstance(override_body, dict) and "max_output_tokens" in override_body
+        ):
+            raise ValueError(
+                "Codex backend rejects max_output_tokens; keep the internal output cap, "
+                "but do not send it as a Codex transport parameter."
+            )
 
         _bound_prompt_cache_key_field(kwargs)
 
