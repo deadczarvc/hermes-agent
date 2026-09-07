@@ -112,6 +112,12 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
     monkeypatch.setattr(main_install_repair, "_clear_update_incomplete_marker", lambda: None)
     # Gateway restart path (called after a successful update).
+    monkeypatch.setattr(
+        update_cmd,
+        "_restart_gateway_fleet_after_update",
+        lambda *a, **k: update_cmd._GatewayRestartOutcome(False, [], [], [], [], [], [], set()),
+    )
+    monkeypatch.setattr(update_cmd, "_resume_windows_gateways_and_merge_outcome", lambda *a, **k: None)
     monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *a, **k: None)
     # Keep the (now surfaced — #78574) gateway auto-restart phase away from
     # this machine's real gateways: discovery returns nothing, systemd is
@@ -127,6 +133,9 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(
         hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
     )
+    monkeypatch.setattr(hermes_gateway, "is_windows", lambda: False)
+    monkeypatch.setattr(hermes_gateway, "kill_gateway_processes", lambda *a, **k: 0)
+    monkeypatch.setattr(hermes_gateway, "_wait_for_gateway_exit", lambda *a, **k: True)
 
 
 def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
