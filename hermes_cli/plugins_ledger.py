@@ -127,13 +127,59 @@ class PluginLedgerMixin:
         del values[index]
         return True
 
-    def _remove_callback(self, mapping: Dict[str, List[Callable]], key: str, callback: Callable) -> None:
-        callbacks = mapping.get(key)
-        if callbacks is None:
+    def _append_callback(
+        self, mapping: Dict[str, List[Callable]], key: str, callback: Callable
+    ) -> None:
+        """Append a callback; hook ownership changes share the timeout-bookkeeping lock."""
+        if mapping is not getattr(self, "_hooks", None):
+            mapping.setdefault(key, []).append(callback)
             return
-        self._remove_identity(callbacks, callback)
-        if not callbacks:
-            mapping.pop(key, None)
+        with self._hook_timeout_lock:
+            mapping.setdefault(key, []).append(callback)
+            lifetime_key = (key, id(callback))
+            lifetime = self._hook_registration_lifetimes.get(lifetime_key)
+            if lifetime is None or lifetime["count"] == 0:
+                self._hook_registration_epoch += 1
+                lifetime = {"count": 0, "epoch": self._hook_registration_epoch}
+                self._hook_registration_lifetimes[lifetime_key] = lifetime
+            lifetime["count"] += 1
+
+    def _forget_hook_timeout_bookkeeping_locked(
+        self, hook_name: str, callback: Callable
+    ) -> None:
+        """Drop retired hook suppression while the lifecycle lock is held."""
+        prefix = (hook_name, id(callback))
+        for suppression_key in tuple(self._hook_timeout_suppressed_until):
+            if suppression_key[:2] == prefix:
+                self._hook_timeout_suppressed_until.pop(suppression_key, None)
+
+    def _remove_callback(self, mapping: Dict[str, List[Callable]], key: str, callback: Callable) -> None:
+        is_hook_mapping = mapping is getattr(self, "_hooks", None)
+        if not is_hook_mapping:
+            callbacks = mapping.get(key)
+            if callbacks is not None:
+                self._remove_identity(callbacks, callback)
+                if not callbacks:
+                    mapping.pop(key, None)
+            return
+        # Lock order: lifecycle/timeout lock -> callback list + lifetime + suppression.  No
+        # callback body or ledger callback runs under this lock.
+        with self._hook_timeout_lock:
+            callbacks = mapping.get(key)
+            removed = callbacks is not None and self._remove_identity(callbacks, callback)
+            if callbacks is not None and not callbacks:
+                mapping.pop(key, None)
+            if not removed:
+                return
+            lifetime_key = (key, id(callback))
+            lifetime = self._hook_registration_lifetimes.get(lifetime_key)
+            if lifetime is None:
+                if not any(candidate is callback for candidate in mapping.get(key, ())):
+                    self._forget_hook_timeout_bookkeeping_locked(key, callback)
+                return
+            lifetime["count"] -= 1
+            if lifetime["count"] == 0:
+                self._forget_hook_timeout_bookkeeping_locked(key, callback)
 
     def _restore_mapping(self, mapping: Dict[str, Any], key: str, current: Any, previous: Optional[Any]) -> bool:
         """Restore a manager-local mapping only when *current* is still present."""
@@ -295,9 +341,19 @@ class PluginLedgerMixin:
         ):
             container.clear()
         self._context_engine = None
+        from hermes_cli.plugins_dispatch import _HOOK_TIMEOUT_GENERATION_ATTR  # lazy: import-order safe
         with self._hook_timeout_lock:
+            # A2 (W3): the generation bump is ATOMIC with the clear it fences. A timeout caller
+            # that started under the old generation and publishes after this point is refused by
+            # the publication's generation check, so the maps an unload-all just emptied cannot be
+            # repopulated by the generation it tore down (measured: maps_cleared_by_force=true and
+            # old_timeout_repopulates_suppression=true, which re-latched healthy callers).
+            setattr(self, _HOOK_TIMEOUT_GENERATION_ATTR,
+                    getattr(self, _HOOK_TIMEOUT_GENERATION_ATTR, 0) + 1)
             self._hook_running_callbacks.clear()
+            self._hook_running_identities.clear()
             self._hook_abandoned.clear()
             self._hook_timeout_suppressed_until.clear()
+            self._hook_registration_lifetimes.clear()
         self._hook_failures_reported.clear()
         self._discovered = False

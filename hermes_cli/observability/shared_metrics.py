@@ -176,10 +176,6 @@ def _ensure_private(path: Path, mode: int) -> None:
             exists = True
         if not exists:
             raise
-    try:
-        path.chmod(mode)
-    except OSError:
-        pass
 
 
 class SharedMetricsStore:

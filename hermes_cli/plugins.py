@@ -951,7 +951,7 @@ class PluginContext:
         if key not in valid:
             logger.warning("Plugin '%s' registered unknown %s '%s' (valid: %s)", self.manifest.name, kind,
                            key, ", ".join(sorted(valid)))
-        mapping.setdefault(key, []).append(callback)
+        self._manager._append_callback(mapping, key, callback)
         handle = self._track(kind, key, lambda: self._manager._remove_callback(mapping, key, callback))
         logger.debug("Plugin %s registered %s: %s", self.manifest.name, kind, key)
         return handle
@@ -1197,10 +1197,13 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # In-flight / recently-timed-out hook callbacks keyed by (hook_name, id(cb), call_identity)
         # so a stuck policy hook cannot spawn a new abandoned thread on every fire.
         self._hook_running_callbacks: Dict[tuple, object] = {}
+        self._hook_running_identities: Dict[tuple, object] = {}
         self._hook_abandoned: Dict[tuple, set] = {}
         self._hook_timeout_suppressed_until: Dict[tuple, float] = {}
         self._hook_timeout_lock = threading.Lock()
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
+        self._hook_registration_lifetimes: Dict[tuple, Dict[str, int]] = {}
+        self._hook_registration_epoch = 0
         # (hook_name, id(cb), repr(exc)) already reported at WARNING; identical repeats go to DEBUG.
         self._hook_failures_reported: set = set()
         # Ledger per plugin (ownership) plus global order (reverse teardown across plugins). Process-
