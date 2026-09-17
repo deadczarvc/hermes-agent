@@ -1915,6 +1915,16 @@ def _config_override_context_length(model: str, base_url: str, provider: str, cu
             cp_ctx = get_custom_provider_context_length(model=model, base_url=base_url, custom_providers=custom_providers)
             if cp_ctx:
                 return cp_ctx
+    # 0c-bis. Canonical provider-scoped per-model override: providers.<name>.models.<model>.context_length.
+    # Закрывает случай, когда провайдер с явным base_url маршрутизируется в custom_providers (записи там нет)
+    # и падает в дефолт 128K — кейс zai/glm-5.2 (2026-07-31). Якорь обновлён 12.09.2026: апстрим переписал
+    # шаг 0c (contextlib.suppress + _config_override_context_length).
+    if provider and model:
+        with contextlib.suppress(Exception):  # fall through to other resolution paths
+            from hermes_cli.config import get_provider_model_context_length
+            pp_ctx = get_provider_model_context_length(provider, model)
+            if pp_ctx:
+                return pp_ctx
     return None
 
 

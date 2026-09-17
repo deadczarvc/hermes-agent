@@ -147,6 +147,10 @@ class TestAllowlistOps:
     def test_tilde_path_approval_records_resolvable_mtime(self, tmp_path, monkeypatch):
         """If the command uses ~ the approval must still find the file."""
         monkeypatch.setenv("HOME", str(tmp_path))
+        # Windows: os.path.expanduser reads USERPROFILE (and HOMEDRIVE/HOMEPATH), not HOME.
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv("HOMEDRIVE", str(tmp_path.drive))
+        monkeypatch.setenv("HOMEPATH", str(tmp_path)[len(str(tmp_path.drive)):])
         target = tmp_path / "hook.sh"
         target.write_text("#!/usr/bin/env bash\n")
         target.chmod(0o755)

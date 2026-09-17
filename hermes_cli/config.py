@@ -1010,6 +1010,40 @@ def get_missing_skill_config_vars() -> List[Dict[str, Any]]:
     values = ((var, cfg_get(config, *f"{SKILL_CONFIG_PREFIX}.{var['key']}".split("."))) for var in all_vars)
     return [var for var, v in values if v is None or (isinstance(v, str) and not v.strip())]
 
+def get_provider_model_context_length(
+    provider: str, model: str, config = None,
+) -> "Optional[int]":
+    if not provider or not model:
+        return None
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+            config = load_config()
+        except Exception:
+            return None
+    if not isinstance(config, dict):
+        return None
+    providers = config.get("providers")
+    if not isinstance(providers, dict):
+        return None
+    provider_cfg = providers.get(provider)
+    if not isinstance(provider_cfg, dict):
+        return None
+    models = provider_cfg.get("models")
+    if not isinstance(models, dict):
+        return None
+    model_cfg = models.get(model)
+    if not isinstance(model_cfg, dict):
+        return None
+    raw_ctx = model_cfg.get("context_length")
+    if raw_ctx is None:
+        return None
+    try:
+        ctx = int(raw_ctx)
+    except (TypeError, ValueError):
+        return None
+    return ctx if ctx > 0 else None
+
 
 def _coerce_config_version(value: Any) -> int:
     """Return a safe integer config version, treating invalid values as legacy."""

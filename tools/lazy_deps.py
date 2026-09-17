@@ -544,7 +544,10 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300, constraint_
         # belt-and-braces pass for the spec's own roots on any tier).
         if uv_bin := _uv_binary():
             try:
-                r = _run_installer([uv_bin, "pip", "install", "--compile-bytecode", *extra_args, *specs], timeout=timeout, env=uv_env)
+                r = _run_installer([
+                    uv_bin, "pip", "install", "--python", sys.executable,
+                    "--compile-bytecode", *extra_args, *specs,
+                ], timeout=timeout, env=uv_env)
                 if r.returncode != 0:
                     logger.debug("uv pip install failed: %s", r.stderr)
                 # A uv resolver failure is authoritative: falling through to pip would discard uv

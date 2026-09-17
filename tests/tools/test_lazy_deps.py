@@ -12,6 +12,7 @@ call is mocked — we never actually shell out during unit tests.
 
 from __future__ import annotations
 
+import sys
 
 import pytest
 
@@ -590,6 +591,12 @@ class TestInstallWarmsBytecode:
         result, calls, _ = self._install(monkeypatch, 1)
         assert result.success is False
         assert calls == []
+
+    def test_uv_tier_targets_the_running_interpreter(self, monkeypatch):
+        """Runtime workers are not project venvs; uv must not rediscover another environment."""
+        _, _, cmds = self._install(monkeypatch, 0)
+        uv_cmd = next(c for c in cmds if c[:3] == ["uv", "pip", "install"])
+        assert uv_cmd[uv_cmd.index("--python") + 1] == sys.executable
 
     def test_uv_tier_compiles_bytecode_for_the_whole_install(self, monkeypatch):
         # uv does not write __pycache__ unless asked (pip does). The flag

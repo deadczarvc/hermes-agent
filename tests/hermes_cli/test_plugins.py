@@ -933,6 +933,195 @@ class TestDeliveryParity:
 class TestAsyncHookCallbacks:
     """``async def`` hook callbacks run and their values land in the results (#12449)."""
 
+    def test_dispose_then_reregister_does_not_inherit_retired_suppression(
+        self, monkeypatch
+    ):
+        """F1: a registration created during dispose gets a fresh suppression epoch."""
+        import time
+
+        manager = PluginManager()
+        context = PluginContext(PluginManifest(name="race-plugin"), manager)
+        trace = []
+        trace_lock = threading.Lock()
+        old_removed = threading.Event()
+        new_registered = threading.Event()
+        finish_dispose = threading.Event()
+
+        def record(event):
+            with trace_lock:
+                trace.append((event, threading.current_thread().name, threading.get_ident()))
+
+        def callback(**_kwargs):
+            record("fresh_callback_ran")
+            return "fresh"
+
+        old_handle = context.register_hook("pre_tool_call", callback)
+        # 2026-09-16: the 0.21+ core keys suppression by (hook, id(cb), tool_scope);
+        # the test mirrors the production triple so the lookup sees the real entry.
+        suppression_key = ("pre_tool_call", id(callback), None)
+        manager._hook_timeout_suppressed_until[suppression_key] = time.monotonic() + 60.0
+        record("old_suppression_seeded")
+
+        real_remove = manager._remove_callback
+
+        def remove_then_pause(mapping, key, target):
+            real_remove(mapping, key, target)
+            record("old_registration_removed")
+            old_removed.set()
+            finish_dispose.wait(timeout=5.0)
+            record("old_dispose_resumed")
+
+        monkeypatch.setattr(manager, "_remove_callback", remove_then_pause)
+        fresh_handles = []
+
+        def dispose_old():
+            old_handle.dispose()
+            record("old_dispose_complete")
+
+        def register_fresh():
+            if not old_removed.wait(timeout=5.0):
+                record("fresh_register_wait_timed_out")
+                return
+            record("fresh_register_begin")
+            fresh_handles.append(context.register_hook("pre_tool_call", callback))
+            record("fresh_register_complete")
+            new_registered.set()
+            finish_dispose.set()
+
+        disposer = threading.Thread(target=dispose_old, name="f1-disposer")
+        registrar = threading.Thread(target=register_fresh, name="f1-registrar")
+        disposer.start()
+        registrar.start()
+        disposer.join(timeout=5.0)
+        registrar.join(timeout=5.0)
+
+        try:
+            assert not disposer.is_alive() and not registrar.is_alive(), trace
+            assert new_registered.is_set(), trace
+            assert manager._hooks["pre_tool_call"] == [callback], trace
+            result = manager.invoke_hook(
+                "pre_tool_call", tool_name="read_file", tool_call_id="fresh"
+            )
+            record(f"fresh_result={result!r}")
+            assert result == ["fresh"], f"F1 losing interleaving: {trace!r}"
+        finally:
+            finish_dispose.set()
+            for handle in fresh_handles:
+                handle.dispose()
+            manager._hook_timeout_suppressed_until.clear()
+
+    def test_suppression_published_before_worker_start_prevents_late_launch(
+        self, monkeypatch
+    ):
+        """F2: suppression published after reservation but before Thread.start wins."""
+        import time
+
+        import hermes_cli.plugins_dispatch as dispatch
+
+        manager = PluginManager()
+        trace = []
+        trace_lock = threading.Lock()
+        other_body_started = threading.Event()
+        target_at_start = threading.Event()
+        force_other_timeout = threading.Event()
+        allow_target_start = threading.Event()
+        release_other = threading.Event()
+        target_launches = []
+        outcomes = {}
+
+        def record(event):
+            with trace_lock:
+                trace.append((event, threading.current_thread().name, threading.get_ident()))
+
+        def callback(**kwargs):
+            call_id = kwargs["tool_call_id"]
+            record(f"callback_body={call_id}")
+            if call_id == "other":
+                other_body_started.set()
+                release_other.wait(timeout=5.0)
+                return "other-finished"
+            target_launches.append(call_id)
+            return "target-ran"
+
+        class _ControlledDoneEvent:
+            def __init__(self):
+                self._event = threading.Event()
+                self._owner = threading.current_thread().name
+
+            def set(self):
+                self._event.set()
+
+            def wait(self, timeout=None):
+                if self._owner == "f2-other-caller" and not self._event.is_set():
+                    force_other_timeout.wait(timeout=5.0)
+                    record("other_wait_forced_timeout")
+                    return False
+                return self._event.wait(timeout=timeout)
+
+        class _ThreadingProxy:
+            Event = _ControlledDoneEvent
+            Thread = threading.Thread
+
+            def __getattr__(self, name):
+                return getattr(threading, name)
+
+        real_start = threading.Thread.start
+
+        def gated_start(worker):
+            if (
+                threading.current_thread().name == "f2-target-caller"
+                and worker.name.startswith("hermes-hook-")
+            ):
+                record("target_reserved_before_start")
+                target_at_start.set()
+                allow_target_start.wait(timeout=5.0)
+                record("target_start_released")
+            return real_start(worker)
+
+        monkeypatch.setattr(dispatch, "threading", _ThreadingProxy())
+        monkeypatch.setattr(threading.Thread, "start", gated_start)
+
+        def run_other():
+            outcomes["other"] = manager._run_hook_callback_bounded(
+                "pre_tool_call", callback, {"tool_call_id": "other"}, 5.0
+            )
+            record(f"other_result={outcomes['other']!r}")
+
+        def run_target():
+            outcomes["target"] = manager._run_hook_callback_bounded(
+                "pre_tool_call", callback, {"tool_call_id": "target"}, 5.0
+            )
+            record(f"target_result={outcomes['target']!r}")
+
+        other_caller = threading.Thread(target=run_other, name="f2-other-caller")
+        target_caller = threading.Thread(target=run_target, name="f2-target-caller")
+        other_caller.start()
+        assert other_body_started.wait(timeout=5.0), trace
+        target_caller.start()
+        assert target_at_start.wait(timeout=5.0), trace
+
+        force_other_timeout.set()
+        other_caller.join(timeout=5.0)
+        suppression_key = ("pre_tool_call", id(callback), None)
+        with manager._hook_timeout_lock:
+            deadline = manager._hook_timeout_suppressed_until.get(suppression_key, 0.0)
+            suppression_active_before_start = deadline > time.monotonic()
+        record(f"suppression_active_before_start={suppression_active_before_start}")
+
+        try:
+            assert not other_caller.is_alive(), trace
+            assert suppression_active_before_start, trace
+            allow_target_start.set()
+            target_caller.join(timeout=5.0)
+            assert not target_caller.is_alive(), trace
+            assert target_launches == [], f"F2 losing interleaving: {trace!r}"
+        finally:
+            allow_target_start.set()
+            release_other.set()
+            other_caller.join(timeout=5.0)
+            target_caller.join(timeout=5.0)
+            manager._hook_timeout_suppressed_until.clear()
+
     def test_async_hook_result_is_awaited_alongside_sync(self):
         mgr = PluginManager()
 
