@@ -255,5 +255,165 @@ class TestSkillManageBatch(unittest.TestCase):
         self.assertEqual(out["operations_applied"], 2)
 
 
+class TestBatchTimeoutAtomicity(unittest.TestCase):
+    """A timed-out or killed batch must leave EITHER every op applied or none.
+
+    Observed failure (logs/errors.log, 2026-09-14 21:12:25): "sequential tool skill_manage
+    timed out after 420.0s". The executor abandons the worker at its deadline
+    (agent/tool_executor.py, _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0) and sets its
+    interrupt bit; nothing tells the batch to stop, so the ops it already wrote stay on
+    disk — and a process that dies mid-loop (dispatcher SIGTERM) leaves them with no
+    record of how to undo them. The transaction journal written before the first op is
+    that record, and the next entry replays it.
+    """
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="skmbatch_to_")
+        os.environ["HERMES_HOME"] = self.home
+        os.environ["HERMES_YOLO_MODE"] = "1"
+        os.makedirs(os.path.join(self.home, "skills"), exist_ok=True)
+        import importlib
+
+        import tools.skill_manager_tool as smt
+        importlib.reload(smt)
+        self.smt = smt
+        from tools import interrupt as _interrupt
+        self.interrupt = _interrupt
+        self.addCleanup(self.interrupt.set_interrupt, False)
+
+    def tearDown(self):
+        self.interrupt.set_interrupt(False)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def _call(self, name, ops):
+        for op in ops:
+            op.setdefault("name", name)
+        return json.loads(self.smt.skill_manage(action="", name="", operations=ops))
+
+    def _skill_md(self, name="probe"):
+        return open(os.path.join(self.home, "skills", name, "SKILL.md")).read()
+
+    def _txn_dirs(self):
+        root = os.path.join(self.home, ".skill-batch-txn")
+        return sorted(os.listdir(root)) if os.path.isdir(root) else []
+
+    def test_timeout_interrupt_midbatch_rolls_the_whole_batch_back(self):
+        """The deadline sets this worker's interrupt bit; the batch must notice it at the
+        next op boundary and undo what it already wrote instead of writing on after the
+        caller stopped listening."""
+        from unittest.mock import patch as _patch
+
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        real = self.smt._skill_manage_from
+        calls = {"n": 0}
+
+        def dispatch(payload, **kw):
+            out = real(payload, **kw)
+            calls["n"] += 1
+            if calls["n"] == 1:  # the 420 s deadline fires right after op 0 landed
+                self.interrupt.set_interrupt(True)
+            return out
+
+        with _patch.object(self.smt, "_skill_manage_from", side_effect=dispatch):
+            r = self._call("probe", [
+                {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
+                {"action": "write_file", "file_path": "references/late.md", "file_content": "late"},
+            ])
+        self.assertFalse(r["success"], r)
+        self.assertEqual(r["completed_before_failure"], 1)
+        self.assertIn("Step 1.", self._skill_md())          # op 0 undone
+        self.assertNotIn("Step ONE.", self._skill_md())
+        self.assertFalse(os.path.exists(
+            os.path.join(self.home, "skills", "probe", "references", "late.md")))
+        self.assertEqual(self._txn_dirs(), [])              # and nothing left behind
+
+    def test_killed_batch_leaves_a_journal_and_the_next_entry_undoes_it(self):
+        """No cancellation signal reaches a killed process: the journal + snapshots on disk
+        are the only record, and the next skill_manage entry must replay them."""
+        from unittest.mock import patch as _patch
+
+        import tools.skill_manager_batch as smb
+
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        real = self.smt._skill_manage_from
+
+        class _Killed(BaseException):
+            pass
+
+        def dispatch(payload, **kw):
+            if payload["action"] == "write_file":  # process died between op 0 and op 1
+                raise _Killed("killed mid-batch")
+            return real(payload, **kw)
+
+        with _patch.object(self.smt, "_skill_manage_from", side_effect=dispatch), \
+             _patch.object(smb, "_rollback", side_effect=RuntimeError("killed before rollback")):
+            with self.assertRaises(_Killed):
+                self._call("probe", [
+                    {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
+                    {"action": "write_file", "file_path": "references/late.md", "file_content": "late"},
+                ])
+        # torn on disk — op 0 landed and no rollback ran — but the journal survived it
+        self.assertIn("Step ONE.", self._skill_md())
+        txns = self._txn_dirs()
+        self.assertEqual(len(txns), 1, txns)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.home, ".skill-batch-txn", txns[0], "journal.json")))
+        # the next entry repairs the torn batch before applying its own op
+        r = self._call("probe", [{"action": "patch", "old_string": "Step 1.",
+                                  "new_string": "Step 1 (recovered)."}])
+        self.assertTrue(r["success"], r)
+        self.assertTrue(r.get("recovered_interrupted_batches"), r)
+        self.assertIn("Step 1 (recovered).", self._skill_md())
+        self.assertNotIn("Step ONE.", self._skill_md())
+        self.assertEqual(self._txn_dirs(), [])
+
+    def test_dead_owner_journal_is_recovered_on_the_next_entry(self):
+        """A batch whose owner process is gone (different pid, not alive) is reclaimed
+        immediately — no waiting for a staleness window."""
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        skill_dir = os.path.join(self.home, "skills", "probe")
+        with open(os.path.join(skill_dir, "SKILL.md"), "w") as fh:  # op 0 landed, then the kill
+            fh.write(SK.format(n="probe").replace("Step 1.", "Step ONE."))
+        snap = os.path.join(self.home, ".skill-batch-txn", "999999999-deadbeef", "snap", "probe")
+        os.makedirs(snap)
+        with open(os.path.join(snap, "SKILL.md"), "w") as fh:
+            fh.write(SK.format(n="probe"))
+        with open(os.path.join(self.home, ".skill-batch-txn", "999999999-deadbeef",
+                               "journal.json"), "w") as fh:
+            json.dump({"batch_id": "999999999-deadbeef", "pid": 999999999, "started_at": 0,
+                       "skills": [{"name": "probe", "pre_dir": skill_dir, "snap": snap}]}, fh)
+        r = self._call("probe", [{"action": "patch", "old_string": "Step 1.",
+                                  "new_string": "Step 1 (after repair)."}])
+        self.assertTrue(r["success"], r)
+        self.assertTrue(r.get("recovered_interrupted_batches"), r)
+        content = self._skill_md()
+        self.assertIn("Step 1 (after repair).", content)
+        self.assertNotIn("Step ONE.", content)
+        self.assertEqual(self._txn_dirs(), [])
+
+    def test_dead_owner_recovery_removes_a_batch_created_skill(self):
+        """The other half of the journal: a skill the interrupted batch CREATED has no
+        pre-batch state to restore, so the repair is removing it — and a staging dir whose
+        owner died before its journal write (nothing applied yet) is swept, not rolled back."""
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        torn = os.path.join(self.home, "skills", "torn")
+        os.makedirs(torn)
+        with open(os.path.join(torn, "SKILL.md"), "w") as fh:
+            fh.write(SK.format(n="torn"))
+        root = os.path.join(self.home, ".skill-batch-txn")
+        os.makedirs(os.path.join(root, "999999999-badc0de"))
+        with open(os.path.join(root, "999999999-badc0de", "journal.json"), "w") as fh:
+            json.dump({"batch_id": "999999999-badc0de", "pid": 999999999, "started_at": 0,
+                       "skills": [{"name": "torn", "pre_dir": None, "snap": None}]}, fh)
+        os.makedirs(os.path.join(root, "999999999-nostage", "snap"))  # died before the journal
+        r = self._call("probe2", [{"action": "create", "content": SK.format(n="probe2")}])
+        self.assertTrue(r["success"], r)
+        self.assertTrue(r.get("recovered_interrupted_batches"), r)
+        self.assertFalse(os.path.exists(torn), "the interrupted batch's created skill must go")
+        self.assertEqual(self._txn_dirs(), [])
+        self.assertIn("Step 1.", open(os.path.join(
+            self.home, "skills", "probe2", "SKILL.md")).read())
+
+
 if __name__ == "__main__":
     unittest.main()

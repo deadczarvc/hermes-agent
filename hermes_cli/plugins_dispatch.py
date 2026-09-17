@@ -10,6 +10,7 @@ import contextvars
 import copy
 import inspect
 import logging
+import os
 import queue
 import re
 import threading
@@ -51,6 +52,24 @@ _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 # After a timeout, suppress the same callback this long so a hung hook cannot pile up threads.
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
+
+# Contention between callers of the SAME callback is not a verdict about the hook: measured
+# 2026-09-14, 920 "skipped ... still running" events in 5 minutes with 4 workers — every one a
+# false fail-closed block on a fast hook (12 callbacks, 0.76 s total). A caller that finds the
+# callback in flight now PARKS on the gate (bounded, FIFO) and fires anyway once the wait budget
+# is spent; only a post-timeout suppression still blocks (see _run_hook_callback_bounded).
+# The wait-then-fire path is itself bounded: at most _HOOK_GATE_MAX_CONCURRENT_LAUNCHES (K=2)
+# launches of ONE callback key may be running at once, and above that the legacy skip is kept —
+# parking must not turn into a stampede, and the mass suppression measured above must go.
+# Kill switch: HERMES_HOOK_GATE_WAIT=0 restores the legacy skip-on-contention behaviour exactly.
+_HOOK_GATE_WAIT_ENV = "HERMES_HOOK_GATE_WAIT"
+_HOOK_GATE_WAIT_MAX_SECONDS = 5.0        # budget = min(this, hook_callback_timeout / 4)
+_HOOK_GATE_WAIT_TIMEOUT_FRACTION = 0.25
+_HOOK_GATE_MAX_WAITERS = 8               # bounded waiting room; overflow fires without the gate
+_HOOK_GATE_MAX_CONCURRENT_LAUNCHES = 2   # lava bound K: simultaneous launches allowed per key
+_HOOK_GATE_WAIT_SAMPLE_CAP = 128         # wait-time samples kept for the waited_p95 metric
+_HOOK_GATE_LEGACY_OFF = frozenset({"0", "false", "no", "off"})
+_HOOK_GATE_INIT_LOCK = threading.Lock()  # guards lazy creation of the per-manager gate state
 
 # System-prompt sections are tightly bounded: they become high-trust prompt bytes charged every turn.
 SYSTEM_PROMPT_SECTION_POSITIONS = frozenset({"after_memory"})
@@ -138,19 +157,30 @@ class _QueuedPluginEvent:
 _HOOK_CALLBACK_TIMEOUT_SECS = 30.0
 _MAX_HOOK_CALLBACK_TIMEOUT_SECS = 600.0
 _HOOK_SKIPPED = object()  # returned by _run_hook_callback_bounded on skip/timeout
+_HOOK_GATE_REENTRANT = object()  # returned by _acquire_hook_gate: the caller already holds it
+# Returned by _acquire_hook_gate: the callback's timeout back-off became active while this caller
+# was parked (A3) — the coarse suppression contract, enforced in the wait → claim transition.
+_HOOK_GATE_SUPPRESSED = object()
+# Manager-local generation of the timeout bookkeeping maps. Bumped (under _hook_timeout_lock,
+# together with the clear) by an unload-all, so a timeout that belongs to the generation that was
+# just torn down cannot repopulate the freshly cleared maps (A2).
+_HOOK_TIMEOUT_GENERATION_ATTR = "_hook_timeout_bookkeeping_generation"
+
+# Call-identity fallback order for the GATE key (H6). Read from the payload the dispatcher
+# already receives - no producer change, no new dependency. NOT api_request_id: it is coarser
+# than a call (one API request carries many tool calls) and would re-collapse keys.
+_HOOK_CALL_IDENTITY_KEYS = ("tool_call_id", "turn_id")
 
 
-def _hook_call_identity(kwargs: Dict[str, Any]) -> Optional[str]:
-    """Identity of the call this callback fires for, or ``None`` when the event has none.
+def _hook_call_identity(kwargs: Mapping[str, Any]) -> Optional[str]:
+    """First non-empty call identity in *kwargs* (``tool_call_id``, then ``turn_id``), else None.
 
-    Concurrent invocations of the same tool in one session must not collapse into one
-    gate key: they are different work, and treating the second as a duplicate drops the
-    hook as if a callback had timed out (upstream #98382). The identity is already in the
-    payload; nothing new is plumbed. Deliberately not ``api_request_id`` — one API request
-    carries many tool calls, which would re-collapse the keys.
+    ``""`` is not an identity: the id paths coerce ``None`` to ``""`` (model_tools._CallIds),
+    so a truthiness test alone would accept the empty string and two unrelated sessionless
+    calls would share a key again.
     """
-    for field in ("tool_call_id", "turn_id"):
-        value = kwargs.get(field)
+    for name in _HOOK_CALL_IDENTITY_KEYS:
+        value = kwargs.get(name)
         if isinstance(value, str) and value:
             return value
     return None
@@ -162,6 +192,198 @@ def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
         return False
     return hook_name in _HOOK_TIMEOUT_BOUNDED_HOOKS or hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
 
+
+def _hook_gate_wait_enabled() -> bool:
+    """Whether a caller parks on a busy callback (default) instead of skipping it.
+
+    ``HERMES_HOOK_GATE_WAIT=0`` restores the exact legacy gate (a sibling in flight skips this
+    call, and for ``pre_tool_call`` that skip is a fail-closed block). Read per call so an
+    operator — or a test — can flip it without restarting the process.
+    """
+    return os.environ.get(_HOOK_GATE_WAIT_ENV, "").strip().lower() not in _HOOK_GATE_LEGACY_OFF
+
+
+class _HookGateSlot:
+    """The FIFO queue of callers parked behind the call in flight for one callback key.
+
+    Waiters park on the manager's condition (the calling thread itself parks, so contention costs
+    no new thread) and tickets keep the queue first-in-first-out, so a burst of callers cannot
+    starve the one that arrived first. The holder itself is NOT duplicated here: it is the
+    ``(hook, callback, tool, session)`` entry in ``_hook_running_callbacks``, so there is exactly
+    one latch — and a plugin unload that clears that map also frees the gate.
+    """
+
+    __slots__ = ("next_ticket", "queue")
+
+    def __init__(self) -> None:
+        self.next_ticket = 0
+        self.queue: List[int] = []
+
+
+class _HookGateStats:
+    """Counters and wait-time samples for one plugin manager's callback gate.
+
+    Observability for the synchronizer: without these numbers a parked caller and a skipped one
+    look identical in the log.
+    """
+
+    __slots__ = ("lock", "fired", "waited", "fail_open", "blocked_after_timeout",
+                 "lava_bound", "_wait_samples")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.fired = 0
+        self.waited = 0
+        self.fail_open = 0
+        self.blocked_after_timeout = 0
+        self.lava_bound = 0  # refused: K launches of this key already running (avalanche guard)
+        self._wait_samples: List[float] = []
+
+    def record_fired(self, waited: float) -> None:
+        """Count one callback launch; a non-zero *waited* also feeds the wait-time samples."""
+        with self.lock:
+            self.fired += 1
+            if waited > 0.0:
+                self.waited += 1
+                self._wait_samples.append(waited)
+                if len(self._wait_samples) > _HOOK_GATE_WAIT_SAMPLE_CAP:
+                    del self._wait_samples[:-_HOOK_GATE_WAIT_SAMPLE_CAP]
+
+    def record_fail_open(self) -> None:
+        with self.lock:
+            self.fail_open += 1
+
+    def record_blocked(self) -> None:
+        with self.lock:
+            self.blocked_after_timeout += 1
+
+    def record_lava_bound(self) -> None:
+        """Count one call the lava bound refused (K launches of its key already running)."""
+        with self.lock:
+            self.lava_bound += 1
+
+    def snapshot(self) -> Dict[str, Any]:
+        """JSON-serializable counters: fired, waited, waited_p95, fail_open,
+        blocked_after_timeout, lava_bound."""
+        with self.lock:
+            samples = sorted(self._wait_samples)
+            p95 = 0.0
+            if samples:
+                # ceil(0.95 * n) - 1 in integer arithmetic: no float index rounding surprises.
+                p95 = samples[max(0, (len(samples) * 95 + 99) // 100 - 1)]
+            return {
+                "fired": self.fired,
+                "waited": self.waited,
+                "waited_p95": round(p95, 4),
+                "fail_open": self.fail_open,
+                "blocked_after_timeout": self.blocked_after_timeout,
+                "lava_bound": self.lava_bound,
+            }
+
+
+class _HookGateState:
+    """Per-manager gate state: the shared condition, the FIFO slots and the counters.
+
+    ``cond`` wraps the manager's existing ``_hook_timeout_lock``, so a gate decision and the
+    suppression bookkeeping stay in one critical section (and the direct uses of that lock in
+    ``plugins_ledger`` keep working). Created lazily by ``_hook_gate_state`` — the dispatcher
+    mixin owns the gate, not ``PluginManager.__init__``.
+    """
+
+    __slots__ = ("cond", "slots", "stats", "launches", "peak_launches")
+
+    def __init__(self, lock: Any) -> None:
+        self.cond = threading.Condition(lock)
+        self.slots: Dict[tuple, _HookGateSlot] = {}
+        self.stats = _HookGateStats()
+        self.launches: Dict[tuple, int] = {}  # key -> launches in flight right now
+        self.peak_launches = 0                # highest value ever seen (observed bound)
+
+    def slot(self, callback_key: tuple) -> _HookGateSlot:
+        """Return (creating if needed) the FIFO slot for *callback_key*; caller holds the lock."""
+        slot = self.slots.get(callback_key)
+        if slot is None:
+            slot = _HookGateSlot()
+            self.slots[callback_key] = slot
+        return slot
+
+    def begin_launch(self, callback_key: tuple, *, bounded: bool) -> bool:
+        """Register one launch of *callback_key*; ``False`` when the lava bound refuses it.
+
+        ``bounded`` marks the wait-then-fire path (the caller owns no gate token): it may add a
+        launch only while the key is below K, otherwise the gate stops synchronizing and becomes
+        a stampede — exactly what the legacy skip protected against. The gate-holding path is
+        serialized by the latch itself, so it increments unconditionally.
+        """
+        with self.cond:
+            current = self.launches.get(callback_key, 0)
+            if bounded and current >= _HOOK_GATE_MAX_CONCURRENT_LAUNCHES:
+                return False
+            self.launches[callback_key] = current + 1
+            if current + 1 > self.peak_launches:
+                self.peak_launches = current + 1
+            return True
+
+    def end_launch(self, callback_key: tuple) -> None:
+        """Drop one launch of *callback_key* — from the CALLER's return path, never the worker.
+
+        An abandoned worker never reaches its finally, and a counter that only ever grows would
+        latch the lava bound shut (a permanent tool outage on the fail-closed hooks); the gate is
+        released by the callback body a moment before the caller decrements, so the count may
+        briefly include a finished call — that errs toward refusing, never toward an extra launch.
+        """
+        with self.cond:
+            current = self.launches.get(callback_key, 0)
+            if current <= 1:
+                self.launches.pop(callback_key, None)
+            else:
+                self.launches[callback_key] = current - 1
+
+    def launches_for(self, callback_key: tuple) -> int:
+        """Launches of *callback_key* in flight right now."""
+        with self.cond:
+            return self.launches.get(callback_key, 0)
+
+    def prune_slot(self, running: Dict[tuple, Any], callback_key: tuple) -> None:
+        """Drop the FIFO slot of *callback_key* once nothing needs it; caller holds the lock.
+
+        A per-call gate key (H6) would otherwise keep one slot per tool call for the life of
+        the process. Droppable only when the queue is empty AND the key has no holder, and
+        every caller holds this lock from ``slot()`` to its own queue/holder transition - so a
+        slot can never be dropped from under a caller that is about to queue on it.
+        """
+        slot = self.slots.get(callback_key)
+        if slot is not None and not slot.queue and callback_key not in running:
+            del self.slots[callback_key]
+
+    def release(self, running: Dict[tuple, Any], callback_key: tuple, token: Any) -> None:
+        """Identity-checked release of *callback_key*: drop the holder and wake the waiters.
+
+        Called on normal completion AND on timeout, so a callback that never returns cannot latch
+        the gate forever: backing off a hung callback is the suppression window's job, while a
+        latched gate would park every later caller (and, before G5, block their tool calls).
+        """
+        with self.cond:
+            holder = running.get(callback_key)
+            if holder is token:
+                del running[callback_key]
+            self.cond.notify_all()
+            self.prune_slot(running, callback_key)
+
+
+class _HookToken:
+    """Identity token for one in-flight hook callback, carrying its start time.
+
+    The start time lets a later skip report HOW LONG the previous call has held the gate:
+    a hung callback is otherwise indistinguishable from a slow one, and the age names
+    the culprit in the log.
+    """
+
+    __slots__ = ("started", "thread_id")
+
+    def __init__(self) -> None:
+        self.started = time.monotonic()
+        self.thread_id = threading.get_ident()
 
 class PluginDispatchMixin:
     @staticmethod
@@ -190,9 +412,10 @@ class PluginDispatchMixin:
 
         Payloads evolve additively: ``**kwargs`` callbacks get everything, narrow signatures only
         what they declare. Each callback is isolated. Bounded hooks and ``pre_tool_call`` run under
-        ``plugins.hook_callback_timeout`` (worker abandoned, never joined); ``pre_tool_call`` fails
-        closed with a block directive, others skip. ``_HOOK_CALLER_THREAD_HOOKS`` always run on the
-        caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a str) to inject.
+        ``plugins.hook_callback_timeout`` (worker abandoned, never joined); a callback already in
+        flight parks the caller (bounded) instead of skipping it; ``pre_tool_call`` fails closed
+        with a block directive, others skip. ``_HOOK_CALLER_THREAD_HOOKS`` always run on the caller
+        thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a str) to inject.
         """
         from hermes_cli.plugins import _resolve_hook_callback_timeout
         # Gateway platform events define event-local envelopes; a bus-wide version here would turn
@@ -203,10 +426,19 @@ class PluginDispatchMixin:
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-        for cb in self._hooks.get(hook_name, []):
+        for cb, registration_epoch in self._snapshot_hook_callbacks(hook_name):
             try:
+                # A callback may DECLARE which tools it applies to; honour that before a
+                # worker starts, so a slow hook for tool A cannot starve unrelated tool B.
+                declared = getattr(cb, "_hermes_tool_matcher", None)
+                if callable(declared):
+                    _tool = kwargs.get("tool_name")
+                    if not isinstance(_tool, str) or not declared(_tool):
+                        continue
                 if use_timeout:
-                    ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
+                    ret = self._run_hook_callback_bounded(
+                        hook_name, cb, kwargs, timeout, registration_epoch=registration_epoch
+                    )
                     if ret is _HOOK_SKIPPED:
                         if fail_closed:  # policy hook: fail closed with a block directive
                             results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
@@ -218,6 +450,61 @@ class PluginDispatchMixin:
             except Exception as exc:
                 self._report_hook_failure(hook_name, cb, kwargs, exc)
         return results
+
+    def _snapshot_hook_callbacks(self, hook_name: str) -> tuple[tuple[Callable, Optional[int]], ...]:
+        """Snapshot callbacks and their registration epochs under the lifecycle lock."""
+        with self._hook_timeout_lock:
+            lifetimes = getattr(self, "_hook_registration_lifetimes", {})
+            return tuple(
+                (
+                    callback,
+                    (
+                        lifetimes[(hook_name, id(callback))]["epoch"]
+                        if lifetimes.get((hook_name, id(callback)), {}).get("count", 0) > 0
+                        else None
+                    ),
+                )
+                for callback in self._hooks.get(hook_name, ())
+            )
+
+    def _hook_timeout_generation(self) -> int:
+        """Generation of this manager's timeout bookkeeping (0 until the first unload-all).
+
+        Read through ``getattr`` so a manager-like double that never ran
+        ``PluginManager.__init__`` still answers 0, and so the counter's only writer stays in the
+        unload-all path next to the maps it fences.
+        """
+        return getattr(self, _HOOK_TIMEOUT_GENERATION_ATTR, 0)
+
+    def _hook_callback_still_registered(self, hook_name: str, cb: Callable) -> bool:
+        """Whether *cb* is still a live registration of *hook_name* on this manager.
+
+        The suppression window is a fact about a REGISTRATION, not about an object address: a
+        callback that a dispose/unload retired must not be able to back-date it. Unknown manager
+        shapes answer ``True`` (publish as before) rather than silently dropping the back-off.
+        """
+        lifetime = getattr(self, "_hook_registration_lifetimes", {}).get((hook_name, id(cb)))
+        if lifetime is not None:
+            return lifetime["count"] > 0
+        hooks = getattr(self, "_hooks", None)
+        if not isinstance(hooks, dict):
+            return True
+        return any(candidate is cb for candidate in hooks.get(hook_name, []))
+
+    def _hook_suppression_remaining_locked(self, suppression_key: tuple) -> float:
+        """Seconds of active timeout back-off for *suppression_key*; ``0.0`` when none is left.
+
+        Caller holds ``_hook_timeout_lock`` (directly, or via the gate's condition, which wraps
+        it). An expired entry is dropped here, so every reader also sweeps.
+        """
+        suppressed_until = self._hook_timeout_suppressed_until.get(suppression_key)
+        if suppressed_until is None:
+            return 0.0
+        now = time.monotonic()
+        if suppressed_until > now:
+            return suppressed_until - now
+        self._hook_timeout_suppressed_until.pop(suppression_key, None)
+        return 0.0
 
     def _report_hook_failure(
         self, hook_name: str, cb: Callable, kwargs: Dict[str, Any], exc: Exception, *, surface: str = "Hook"
@@ -244,49 +531,142 @@ class PluginDispatchMixin:
             surface, hook_name, callback_name, exc, surface.lower(), ", ".join(sorted(kwargs)) or "no fields")
 
     def _run_hook_callback_bounded(
-        self, hook_name: str, cb: Callable, kwargs: Dict[str, Any], timeout: float
+        self, hook_name: str, cb: Callable, kwargs: Dict[str, Any], timeout: float, *,
+        registration_epoch: Optional[int] = None,
     ) -> Any:
         """Run one callback on a daemon worker with a wall-clock cap; ``_HOOK_SKIPPED`` when
-        suppressed, still running, timed out (worker abandoned, never joined), or the worker
-        could not be started. Exceptions propagate."""
+        suppressed after a previous timeout, re-entered from the callback's own thread, timed out
+        (worker abandoned, never joined), or the worker could not be started. A callback that is
+        merely *in flight* is not a skip: the caller parks on the gate (bounded, FIFO) and fires
+        anyway once the wait budget is spent, so one session cannot block another. Exceptions
+        propagate."""
         callback_name = getattr(cb, "__name__", repr(cb))
-        # Suppression is a fact about the CALLBACK — a hung one must keep its back-off —
-        # so that key stays coarse. The gate must instead tell CONCURRENT CALLS apart.
-        suppression_key = (hook_name, id(cb))
-        gate_key = (*suppression_key, _hook_call_identity(kwargs))
-        token = object()
+        # Gate one callback across tools/sessions/calls; call identity remains telemetry only.
+        _tool_scope = kwargs.get("tool_name")
+        callback_key = (hook_name, id(cb))
+        # Suppression is callback+tool scoped; lifecycle hooks keep ``tool=None`` callback-wide.
+        suppression_key = (
+            hook_name,
+            id(cb),
+            _tool_scope if isinstance(_tool_scope, str) else None,
+        )
+        call_identity = _hook_call_identity(kwargs)
+        identity_key = (
+            (hook_name, id(cb), call_identity) if call_identity is not None else None
+        )
+        gate = self._hook_gate_state()
+        token = _HookToken()
+        blocked_for = 0.0
         with self._hook_timeout_lock:
-            suppressed_until = self._hook_timeout_suppressed_until.get(suppression_key)
-            # A worker abandoned on timeout still holds a thread; a fresh call id must not
-            # start a second one for the same callback, or a hung plugin leaks a thread per call.
-            running = (gate_key in self._hook_running_callbacks
-                       or bool(self._hook_abandoned.get(suppression_key)))
-            if (suppressed_until is not None and suppressed_until > time.monotonic()) or running:
+            # A2 (W3): the generation this launch belongs to. Captured BEFORE the worker starts,
+            # so a timeout that lands after an unload-all tore those maps down is recognizable as
+            # a late write from the dead generation and refused at the publication below.
+            generation = self._hook_timeout_generation()
+            # Whether this launch came from a LIVE registration at all: a callback invoked
+            # directly (diagnostic/direct dispatcher use) was never in ``_hooks``, so the
+            # registration half of the A2 fence must not be applied to it.
+            registered_at_launch = self._hook_callback_still_registered(hook_name, cb)
+            blocked_for = self._hook_suppression_remaining_locked(suppression_key)
+            running_identities = getattr(self, "_hook_running_identities", None)
+            if running_identities is None:
+                running_identities = {}
+                self._hook_running_identities = running_identities
+        if blocked_for > 0.0:
+            # The one remaining blocking reason: this callback already ran away once, so a policy
+            # hook stays fail-closed until the suppression window expires.
+            gate.stats.record_blocked()
+            logger.warning(
+                "Hook '%s' callback %s skipped after previous timeout (%.1fs of suppression left)",
+                hook_name, callback_name, blocked_for)
+            return _HOOK_SKIPPED
+        with self._hook_timeout_lock:
+            if identity_key is not None and identity_key in self._hook_running_identities:
                 logger.warning(
-                    "Hook '%s' callback %s skipped after previous "
-                    "timeout or while still running", hook_name, callback_name)
+                    "Hook '%s' callback %s skipped: call identity %s is already running",
+                    hook_name, callback_name, call_identity)
                 return _HOOK_SKIPPED
-            if suppressed_until is not None:
-                self._hook_timeout_suppressed_until.pop(suppression_key, None)
-            self._hook_running_callbacks[gate_key] = token
+            if getattr(self, "_hook_abandoned", {}).get(callback_key):
+                logger.warning(
+                    "Hook '%s' callback %s skipped while an abandoned worker is still running",
+                    hook_name, callback_name)
+                return _HOOK_SKIPPED
+        # Contention is not a verdict: park (bounded, FIFO) on the sibling call instead of
+        # skipping it, and fire anyway once the budget is spent. Without the park a fast hook in
+        # another session rejects this tool call — the false block measured 2026-09-14.
+        wait_budget = min(_HOOK_GATE_WAIT_MAX_SECONDS, timeout * _HOOK_GATE_WAIT_TIMEOUT_FRACTION)
+        acquired = self._acquire_hook_gate(
+            gate, callback_key, suppression_key, token, wait_budget
+        )
+        if acquired is _HOOK_SKIPPED:
+            logger.warning(
+                "Hook '%s' callback %s skipped: waiting is disabled (%s=0) and a sibling call "
+                "holds the gate", hook_name, callback_name, _HOOK_GATE_WAIT_ENV)
+            return _HOOK_SKIPPED
+        if acquired is _HOOK_GATE_REENTRANT:
+            logger.warning(
+                "Hook '%s' callback %s skipped: re-entrant call from the thread already running it",
+                hook_name, callback_name)
+            return _HOOK_SKIPPED
+        if acquired is _HOOK_GATE_SUPPRESSED:
+            # A3 (W3): this caller was already past the suppression pre-check when the back-off
+            # became active (the sibling it parked behind just timed out). Rechecked under the
+            # gate's condition — the same lock the timeout publication takes — so the check and
+            # the claim cannot interleave. No token was installed and the queued ticket is
+            # released by _acquire_hook_gate's finally: no worker, no counter drift.
+            with self._hook_timeout_lock:
+                remaining = self._hook_suppression_remaining_locked(suppression_key)
+            gate.stats.record_blocked()
+            logger.warning(
+                "Hook '%s' callback %s skipped: previous timeout back-off became active while "
+                "this call was waiting (%.1fs of suppression left)", hook_name, callback_name, remaining)
+            return _HOOK_SKIPPED
+        holding, waited, fail_open_reason = acquired
+        # Lava bound (2026-09-14, operator decision A/K=2): the wait-then-fire path adds a launch
+        # only while this key is below K simultaneous launches. Above that the legacy behaviour is
+        # kept — skip, which pre_tool_call turns into a fail-closed block — because past K the gate
+        # no longer synchronizes anything and a stampede is what the skip existed to prevent.
+        if not gate.begin_launch(callback_key, bounded=bool(fail_open_reason)):
+            concurrent = gate.launches_for(callback_key)
+            gate.stats.record_lava_bound()
+            logger.warning(
+                "Hook '%s' callback %s skipped: %d launches of this key already running (lava "
+                "bound K=%d) — legacy fail-closed skip kept",
+                hook_name, callback_name, concurrent, _HOOK_GATE_MAX_CONCURRENT_LAUNCHES)
+            return _HOOK_SKIPPED
+        with self._hook_timeout_lock:
+            if identity_key is not None:
+                self._hook_running_identities[identity_key] = token
+        if fail_open_reason:
+            logger.warning(
+                "Hook '%s' callback %s fired WITHOUT the gate after waiting %.2fs (%s) — a slow "
+                "sibling is not a verdict on this call",
+                hook_name, callback_name, waited, fail_open_reason)
 
         context = contextvars.copy_context()
         done = threading.Event()
         outcome: Dict[str, Any] = {}
         failure: Dict[str, Exception] = {}
+        admission = threading.Condition()
+        admission_state = {"ready": False, "cancelled": False}
 
         def _release_token() -> None:
+            gate.release(self._hook_running_callbacks, callback_key, token)
             with self._hook_timeout_lock:
-                if self._hook_running_callbacks.get(gate_key) is token:
-                    self._hook_running_callbacks.pop(gate_key, None)
-                    abandoned = self._hook_abandoned.get(suppression_key)
-                    if abandoned is not None:
-                        abandoned.discard(gate_key)
-                        if not abandoned:
-                            self._hook_abandoned.pop(suppression_key, None)
+                if (identity_key is not None
+                        and self._hook_running_identities.get(identity_key) is token):
+                    self._hook_running_identities.pop(identity_key, None)
+                abandoned = getattr(self, "_hook_abandoned", {}).get(callback_key)
+                if abandoned is not None:
+                    abandoned.discard(token)
+                    if not abandoned:
+                        self._hook_abandoned.pop(callback_key, None)
 
         def _runner() -> None:
             try:
+                with admission:
+                    admission.wait_for(lambda: admission_state["ready"])
+                    if admission_state["cancelled"]:
+                        return
                 outcome["value"] = context.run(self._invoke_hook_callback, cb, kwargs)
             except Exception as exc:
                 failure["exc"] = exc
@@ -299,26 +679,195 @@ class PluginDispatchMixin:
             thread.start()
         except RuntimeError as exc:
             _release_token()  # the runner's finally never runs when OS thread creation fails
+            gate.end_launch(callback_key)  # nor does the caller tail: give the slot back here
             logger.warning(
                 "Hook '%s' callback %s worker failed to start: %s — skipping",
                 hook_name, callback_name, exc)
             return _HOOK_SKIPPED
-        if not done.wait(timeout=timeout):  # do not join — that would reintroduce the hang
-            with self._hook_timeout_lock:
-                # See #6622.
-                self._hook_timeout_suppressed_until[suppression_key] = (
-                    time.monotonic() + self._hook_timeout_suppression_seconds)
-                # The worker may have finished (and released its token) between the wait
-                # expiring and this lock; recording it as abandoned then would block the
-                # callback for that call id until reload with no thread behind it.
-                if self._hook_running_callbacks.get(gate_key) is token:
-                    self._hook_abandoned.setdefault(suppression_key, set()).add(gate_key)
+        # F2: Thread.start may be delayed after reservation.  The worker cannot enter the
+        # callback body until suppression is rechecked under the publication/lifecycle lock.
+        with self._hook_timeout_lock:
+            suppressed_before_admission = (
+                self._hook_suppression_remaining_locked(suppression_key) > 0.0
+            )
+            with admission:
+                admission_state["cancelled"] = suppressed_before_admission
+                admission_state["ready"] = True
+                admission.notify_all()
+        if suppressed_before_admission:
+            _release_token()
+            gate.end_launch(callback_key)
+            gate.stats.record_blocked()
             logger.warning(
-                "Hook '%s' callback %s timed out after %gs — skipping", hook_name, callback_name, timeout)
+                "Hook '%s' callback %s skipped: timeout suppression became active before "
+                "worker admission", hook_name, callback_name)
             return _HOOK_SKIPPED
-        if "exc" in failure:
-            raise failure["exc"]
-        return outcome.get("value")
+        gate.stats.record_fired(waited)  # the callback runs now, fail-open included
+        if not holding:
+            gate.stats.record_fail_open()
+        try:
+            if not done.wait(timeout=timeout):  # do not join — that would reintroduce the hang
+                stale_generation = False
+                with self._hook_timeout_lock:
+                    # See #6622. A2 (W3): publish a suppression ONLY for the generation that is
+                    # still current, and — when this launch came from a live registration — only
+                    # while that registration is still live. The unload-all clear and its
+                    # generation bump happen under this same lock, so this write either precedes
+                    # the clear (and is wiped by it) or follows it and is refused here: the maps
+                    # an unload-all emptied can no longer be repopulated by the generation it
+                    # tore down. Same guard for a registration disposed while its abandoned
+                    # worker was still running (A1) — the retired callback must not back-date a
+                    # deadline onto the address it is about to give up.
+                    current_lifetime = getattr(
+                        self, "_hook_registration_lifetimes", {}
+                    ).get((hook_name, id(cb)))
+                    registration_retired = (
+                        registration_epoch is not None
+                        and (
+                            current_lifetime is None
+                            or current_lifetime["count"] == 0
+                            or current_lifetime["epoch"] != registration_epoch
+                        )
+                    )
+                    if (self._hook_timeout_generation() != generation
+                            or registration_retired
+                            or (registration_epoch is None and registered_at_launch
+                                and not self._hook_callback_still_registered(hook_name, cb))):
+                        stale_generation = True
+                    else:
+                        self._hook_timeout_suppressed_until[suppression_key] = (
+                            time.monotonic() + self._hook_timeout_suppression_seconds)
+                    if self._hook_running_callbacks.get(callback_key) is token:
+                        abandoned_callbacks = getattr(self, "_hook_abandoned", None)
+                        if abandoned_callbacks is None:
+                            abandoned_callbacks = {}
+                            self._hook_abandoned = abandoned_callbacks
+                        abandoned_callbacks.setdefault(callback_key, set()).add(token)
+                if stale_generation:
+                    logger.warning(
+                        "Hook '%s' callback %s timed out after %gs but its registration is no "
+                        "longer live — not repopulating the timeout bookkeeping of the cleared "
+                        "generation", hook_name, callback_name, timeout)
+                # 2026-09-14: the abandoned worker may never reach its finally, so the running
+                # slot and the gate holder are released HERE (identity-checked); otherwise the
+                # callback stays latched for the life of the process, which for pre_tool_call
+                # (fail-closed) is a permanent tool outage. Backing off a hung callback is the
+                # suppression window's job, not a latched slot; G5 adds the gate half so a parked
+                # caller is never left waiting on a holder that will never finish. Outside the
+                # with-block below on purpose: gate.release takes that same non-reentrant lock.
+                gate.release(self._hook_running_callbacks, callback_key, token)
+                logger.warning(
+                    "Hook '%s' callback %s timed out after %gs — skipping",
+                    hook_name, callback_name, timeout)
+                return _HOOK_SKIPPED
+            if "exc" in failure:
+                raise failure["exc"]
+            return outcome.get("value")
+        finally:
+            # The launch slot belongs to the CALLER, not the worker (see end_launch).
+            gate.end_launch(callback_key)
+
+    def _acquire_hook_gate(
+        self, gate: _HookGateState, callback_key: tuple, suppression_key: tuple,
+        token: _HookToken, wait_budget: float
+    ) -> Any:
+        """Claim the per-callback gate, parking FIFO while a sibling call holds it.
+
+        Returns ``(token_or_None, waited_seconds, fail_open_reason)``; a ``None`` token means the
+        caller must fire WITHOUT the gate (wait budget spent, or the waiting room is full) —
+        fail-open, because another session's slow hook is not a verdict on this call. Returns
+        ``_HOOK_SKIPPED`` only for a re-entrant call from the holder's own thread, which must not
+        nest into its own callback, and ``_HOOK_GATE_SUPPRESSED`` when the callback's timeout
+        back-off became active after the caller's pre-check (A3): the claim and the suppression
+        recheck happen in ONE critical section — ``gate.cond`` wraps ``_hook_timeout_lock``, the
+        same lock the timeout publication takes — so a parked caller can no longer launch a worker
+        during the back-off. Nothing is left claimed on that path: the token is never installed
+        into ``running`` and the queued ticket is dropped by ``finally``.
+        """
+        started = time.monotonic()
+        deadline = started + wait_budget
+        running = self._hook_running_callbacks
+        with gate.cond:  # the same underlying lock, so the queue and the holder map move together
+            # The slot is taken INSIDE this critical section, not before it: H6 keys make slots
+            # numerous and droppable, and a caller must never park on a slot the release/prune
+            # path has already dropped - that would give one key two FIFOs.
+            slot = gate.slot(callback_key)
+            holder = running.get(callback_key)
+            if holder is not None and holder.thread_id == threading.get_ident():
+                return _HOOK_GATE_REENTRANT
+            if holder is None and not slot.queue:
+                if self._hook_suppression_remaining_locked(suppression_key) > 0.0:
+                    return _HOOK_GATE_SUPPRESSED
+                running[callback_key] = token
+                return token, 0.0, ""
+            if not _hook_gate_wait_enabled():
+                # Kill switch: legacy behaviour — a sibling in flight skips this call.
+                return _HOOK_SKIPPED
+            if len(slot.queue) >= _HOOK_GATE_MAX_WAITERS:
+                # A3 (W3): the overflow path fires WITHOUT the gate — the last launch-permitting
+                # exit of this method, so it rechecks the back-off too.
+                if self._hook_suppression_remaining_locked(suppression_key) > 0.0:
+                    return _HOOK_GATE_SUPPRESSED
+                return None, time.monotonic() - started, "waiting room full (%d)" % _HOOK_GATE_MAX_WAITERS
+            ticket = slot.next_ticket
+            slot.next_ticket += 1
+            slot.queue.append(ticket)
+            try:
+                while True:
+                    holder = running.get(callback_key)
+                    if holder is None and slot.queue and slot.queue[0] == ticket:
+                        # A3 (W3): the wait → claim transition rechecks the back-off under the
+                        # same lock the timeout publication takes. The sibling this caller
+                        # parked behind may have timed out meanwhile: without this recheck the
+                        # caller claims the freed token and launches a worker INSIDE the
+                        # back-off window (measured: starts=2, waiter_launched_during_suppression).
+                        if self._hook_suppression_remaining_locked(suppression_key) > 0.0:
+                            return _HOOK_GATE_SUPPRESSED
+                        slot.queue.pop(0)
+                        running[callback_key] = token
+                        return token, time.monotonic() - started, ""
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        # The wait-then-fire path would launch here; a back-off that became
+                        # active during the wait outranks fail-open (same coarse contract).
+                        if self._hook_suppression_remaining_locked(suppression_key) > 0.0:
+                            return _HOOK_GATE_SUPPRESSED
+                        return None, time.monotonic() - started, "wait budget %.2fs spent" % wait_budget
+                    gate.cond.wait(remaining)
+            finally:  # a caller that leaves the queue early must keep the FIFO order honest
+                if ticket in slot.queue:
+                    slot.queue.remove(ticket)
+                    gate.cond.notify_all()
+                gate.prune_slot(running, callback_key)  # the caller still holds the lock here
+
+    def _hook_gate_state(self) -> _HookGateState:
+        """Return this manager's gate state, creating it on first use.
+
+        Lazy (rather than in ``PluginManager.__init__``) because the dispatcher mixin owns the
+        gate: the condition wraps the existing ``_hook_timeout_lock``, so the gate and the timeout
+        bookkeeping share one critical section.
+        """
+        state = getattr(self, "_hook_gate_state_singleton", None)
+        if state is None:
+            with _HOOK_GATE_INIT_LOCK:
+                state = getattr(self, "_hook_gate_state_singleton", None)
+                if state is None:
+                    state = _HookGateState(self._hook_timeout_lock)
+                    self._hook_gate_state_singleton = state
+        return state
+
+    def hook_gate_metrics(self) -> Dict[str, Any]:
+        """Gate counters as JSON-friendly data: fired, waited, waited_p95, fail_open,
+        blocked_after_timeout, lava_bound, concurrent_peak, launches_in_flight, slots (live
+        gate slots, pruned when idle). Makes the synchronizer observable instead of a matter
+        of faith."""
+        state = self._hook_gate_state()
+        data = state.stats.snapshot()
+        with state.cond:
+            data["concurrent_peak"] = state.peak_launches
+            data["launches_in_flight"] = sum(state.launches.values())
+            data["slots"] = len(state.slots)
+        return data
 
     def _subscribe_event(self, owner: str, event: str, callback: Callable) -> None:
         """Add an owner-tagged event subscription in registration order."""

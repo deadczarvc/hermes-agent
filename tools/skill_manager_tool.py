@@ -32,7 +32,7 @@ from tools.skill_manager_guards import (
     _background_review_preflight, _background_review_read_before_write_guard, _background_review_write_guard,
     _containing_skills_root, _curator_consolidation_delete_guard, _maybe_auto_propose_org_edit,
     _org_mirror_write_guard, _pinned_guard, _validate_delete_target, _is_background_review, _refusal as _err)
-from tools.skill_manager_batch import _skill_manage_batch
+from tools.skill_manager_batch import _skill_manage_batch, _recover_interrupted_batches
 from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
 
 logger = logging.getLogger(__name__)
@@ -791,7 +791,40 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
         _maybe_debounced_sync_push(name)
 
 
+def _announce_recovery(raw: str, notes) -> str:
+    """Append the repair note to a successful result: a caller whose earlier call timed out
+    should learn here that its half-applied ops were undone, not discover it on disk."""
+    if not notes:
+        return raw
+    with suppress(Exception):
+        payload = json.loads(raw)
+        if isinstance(payload, dict) and payload.get("success"):
+            payload["recovered_interrupted_batches"] = notes
+            return json.dumps(payload, ensure_ascii=False)
+    return raw
+
+
 def skill_manage(
+    action: str, name: str, content: str = None, category: str = None, file_path: str = None,
+    file_content: str = None, old_string: str = None, new_string: str = None,
+    replace_all: bool = False, absorbed_into: str = None, task_id: str = None,
+    session_id: str = None, operations=None) -> str:
+    """Single entry point for every skill mutation: repair an interrupted batch FIRST (a call
+    that hit the tool executor's deadline, or a process that was killed, leaves a transaction
+    journal whose half-applied ops must be undone before this call writes anything — see
+    tools.skill_manager_batch), then dispatch to the action handler -> JSON string.
+    ``operations`` (atomic batch shape, see _skill_manage_batch) overrides the flat fields."""
+    notes = _recover_interrupted_batches()
+    return _announce_recovery(
+        _skill_manage_dispatch(
+            action, name, content=content, category=category, file_path=file_path,
+            file_content=file_content, old_string=old_string, new_string=new_string,
+            replace_all=replace_all, absorbed_into=absorbed_into, task_id=task_id,
+            session_id=session_id, operations=operations),
+        notes)
+
+
+def _skill_manage_dispatch(
     action: str, name: str, content: str = None, category: str = None, file_path: str = None,
     file_content: str = None, old_string: str = None, new_string: str = None,
     replace_all: bool = False, absorbed_into: str = None, task_id: str = None,

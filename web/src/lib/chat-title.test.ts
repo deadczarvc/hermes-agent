@@ -27,6 +27,12 @@ describe("titleFromSessionInfoPayload", () => {
     expect(titleFromSessionInfoPayload({ title: "   " })).toBeNull();
   });
 
+  it("returns undefined for non-object truthy payloads", () => {
+    expect(titleFromSessionInfoPayload(42)).toBeUndefined();
+    expect(titleFromSessionInfoPayload("str")).toBeUndefined();
+    expect(titleFromSessionInfoPayload(true)).toBeUndefined();
+  });
+
   it("returns the normalized title when present", () => {
     expect(titleFromSessionInfoPayload({ title: "  Live session title " })).toBe(
       "Live session title",
