@@ -1632,6 +1632,9 @@ class _AnthropicCompletionsAdapter:
     def create(self, **kwargs) -> Any:
         from agent.anthropic_adapter import build_anthropic_kwargs, create_anthropic_message
         from agent.transports import get_transport
+        # MoA aggregator fan-in calls aux with stream=True; the wire call below is
+        # non-streaming, so synthesize OpenAI-shaped chunks. (#moa-aux-stream)
+        _wire_stream = bool(kwargs.get("stream"))
         model = kwargs.get("model", self._model)
         # ZAI's Anthropic endpoint rejects max_tokens on vision models (code 1210);
         # callers signal this via _skip_zai_max_tokens.
@@ -1723,7 +1726,82 @@ class _AnthropicCompletionsAdapter:
             message=SimpleNamespace(content=_nr.content, tool_calls=_nr.tool_calls, reasoning=_nr.reasoning),
             finish_reason=_nr.finish_reason,
         )
-        return SimpleNamespace(choices=[choice], model=model, usage=usage)
+        complete = SimpleNamespace(choices=[choice], model=model, usage=usage)
+        if _wire_stream:
+            return _complete_response_as_chunk_stream(complete)
+        return complete
+
+
+def _complete_response_as_chunk_stream(response: Any) -> Any:
+    """Yield OpenAI-shaped stream chunks synthesized from a complete response.
+
+    The aux Anthropic adapter is non-streaming at the wire level. When a
+    caller requested ``stream=True`` (MoA aggregator fan-in), hand back an
+    iterable of chunk-shaped SimpleNamespaces matching what the SDK stream
+    would have produced: content delta, finish-reason chunk, then a final
+    empty-choices usage chunk (the shape the main loop reads usage from).
+    The generator also exposes ``.close()`` so ManagedLlmStream cleanup is
+    safe. (#moa-aux-stream)
+    """
+    choice = None
+    if getattr(response, "choices", None):
+        choice = response.choices[0]
+    message = getattr(choice, "message", None)
+    model = getattr(response, "model", None)
+
+    reasoning = getattr(message, "reasoning", None)
+    if reasoning:
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(
+                index=0,
+                delta=SimpleNamespace(
+                    content=None, reasoning_content=reasoning, tool_calls=None),
+                finish_reason=None,
+            )],
+            model=model,
+            usage=None,
+        )
+
+    content = getattr(message, "content", None)
+    if content:
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(
+                index=0,
+                delta=SimpleNamespace(
+                    content=content, tool_calls=None),
+                finish_reason=None,
+            )],
+            model=model,
+            usage=None,
+        )
+
+    tool_calls = getattr(message, "tool_calls", None)
+    if tool_calls:
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(
+                index=0,
+                delta=SimpleNamespace(
+                    content=None, tool_calls=tool_calls),
+                finish_reason=None,
+            )],
+            model=model,
+            usage=None,
+        )
+
+    yield SimpleNamespace(
+        choices=[SimpleNamespace(
+            index=0,
+            delta=SimpleNamespace(content=None, tool_calls=None),
+            finish_reason=getattr(choice, "finish_reason", None) or "stop",
+        )],
+        model=model,
+        usage=None,
+    )
+
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        yield SimpleNamespace(choices=[], model=model, usage=usage)
+
 
 
 class AnthropicAuxiliaryClient:
