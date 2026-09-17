@@ -168,7 +168,13 @@ def _ensure_private(path: Path, mode: int) -> None:
         else:
             path.touch(mode=mode, exist_ok=True)
     except OSError:
-        if not path.is_dir():
+        try:
+            exists = path.is_dir()
+        except OSError:
+            # stat denied (WinError 5) - state unknowable; treat as existing.
+            # Telemetry must never hard-fail a turn (2026-09-17 ACL incident).
+            exists = True
+        if not exists:
             raise
     try:
         path.chmod(mode)
