@@ -221,6 +221,12 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             if length > _MAX_BODY:
                 return self._error(413, None, protocol.ERR_PARSE, "payload too large")
+            # Header before body (A2A spec: ContentTypeNotSupportedError). Parsing first turns a
+            # wrong Content-Type into a ParseError, which is what TCK JSONRPC-SSE-002 catches.
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype and not ctype.startswith("application/json"):
+                return self._error(415, None, protocol.ERR_CONTENT_TYPE_NOT_SUPPORTED,
+                                   f"Content-Type not supported: {ctype}")
             req = json.loads((self.rfile.read(length) if length else b"{}").decode("utf-8"))
         except Exception:
             return self._error(400, None, protocol.ERR_PARSE, "parse error")
@@ -527,14 +533,24 @@ class A2AAdapter(BasePlatformAdapter):
 
     def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
         """Validate, register, and dispatch an inbound message (HTTP worker thread). Returns
-        (terminal_task, None) when it ends immediately, else (None, pending) with the future to wait on."""
+        (terminal_task, None) when it ends immediately — including the idempotent replay of an
+        earlier task, which may still be running — else (None, pending) with the future to wait on."""
         agent = agent or self._agents[""]
         text = protocol.extract_text(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
+        # Idempotency: atomically claim (peer, messageId, scope) before turn accounting and dispatch.
+        # No messageId -> no key (historical behaviour).
+        message_id = protocol.extract_message_id(params)
         task_id = protocol.new_task_id()
+        rec, created = self.tasks.create_or_find_by_message(
+            task_id, context_id, peer, *self._scope_for_agent(agent), message_id=message_id
+        )
+        if not created:
+            logger.info("A2A: duplicate messageId %s from peer %s — replaying task %s (%s)",
+                        message_id, peer, rec["task_id"], rec["state"])
+            return protocol.TaskStore.to_task(rec), None
         turn = self._turns.track(context_id)
         max_turns = protocol.max_pingpong_turns()
-        rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
         if turn > max_turns:
             protocol.metrics.anti_loop_triggers += 1
             logger.warning("A2A: anti-loop triggered for context %s (turn %d > %d)", context_id, turn, max_turns)
@@ -585,11 +601,9 @@ class A2AAdapter(BasePlatformAdapter):
                 profile, "SELECT id FROM sessions WHERE title = ? ORDER BY started_at DESC LIMIT 1",
                 (session_title,), "A2A: could not lookup forwarded session")
             cmd = ["hermes", "chat", "-q", framed_text, "-Q", "--source", "a2a"] + (["--resume", session_id] if session_id else [])
-            # The child IS the target profile's turn: build its env for that home (launch .env /
-            # TERMINAL_* residue dropped, the target's own secrets overlaid), not the gateway's raw environ.
-            from tools.environments.local import served_profile_child_env
-            env = served_profile_child_env(target_home=_profile_home(profile), inherit_credentials=True)
-            env["HERMES_A2A_PEER"] = peer
+            env = {**os.environ, "HERMES_A2A_PEER": peer}
+            if home := _profile_home(profile):
+                env["HERMES_HOME"] = home
             start = time.time()
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -702,7 +716,16 @@ class A2AAdapter(BasePlatformAdapter):
         try:
             terminal, pending = self._prepare_task(params, peer, agent=agent)
             if terminal is not None:
-                return self._emit_terminal(handler, terminal["id"], terminal["contextId"], terminal["status"]["state"],
+                state = terminal["status"]["state"]
+                if state not in protocol.TERMINAL_STATES:
+                    # Idempotent replay of a task that is still running: mirror its stream (and its
+                    # eventual terminal events) instead of closing with a bogus terminal state.
+                    task_id, context_id = terminal["id"], terminal["contextId"]
+                    self._sse_write(handler, protocol.sse_data(protocol.stream_task(terminal), req_id))
+                    self._sse_write(handler, protocol.sse_data(protocol.status_update(task_id, context_id, state), req_id))
+                    rec = self.tasks.get(task_id, *self._scope_for_agent(agent)) or {}
+                    return self._stream_existing_task(handler, req_id, task_id, context_id, agent, rec)
+                return self._emit_terminal(handler, terminal["id"], terminal["contextId"], state,
                                            protocol.extract_text(terminal.get("status", {}).get("message", {}) or {}), req_id=req_id)
             task_id, context_id = pending["task_id"], pending["context_id"]
             submitted = protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"])
@@ -716,6 +739,16 @@ class A2AAdapter(BasePlatformAdapter):
                 self._finalize_task(pending, protocol.STATE_FAILED, "[client disconnected]")
             logger.debug("A2A: stream client disconnected")
 
+    def _stream_existing_task(self, handler, req_id: Any, task_id: str, context_id: str, agent: Optional[dict],
+                              rec: dict) -> None:
+        """Mirror an already-registered task over an open SSE response: await it, then emit its
+        terminal events (shared by tasks/subscribe and the idempotent replay of a running task)."""
+        if (fut := self.tasks.watch(task_id, *self._scope_for_agent(agent))) is None:
+            return self._sse_write(handler, protocol.sse_done())
+        state, reply = self._await_future(fut, time.time() + _reply_timeout(), self._keepalive(handler),
+                                          (rec.get("state", protocol.STATE_FAILED), rec.get("reply", "")))
+        self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
+
     def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None) -> None:
         """Reconnect to an existing task's stream (v1.0 SubscribeToTask)."""
         task_id, rec, error = self._find_task(req_id, params, agent)
@@ -723,11 +756,7 @@ class A2AAdapter(BasePlatformAdapter):
             return handler._json(200, error)
         self._sse_headers(handler)
         try:
-            if (fut := self.tasks.watch(task_id, *self._scope_for_agent(agent))) is None:
-                return self._sse_write(handler, protocol.sse_done())
-            state, reply = self._await_future(fut, time.time() + _reply_timeout(), self._keepalive(handler),
-                                              (rec["state"], rec.get("reply", "")))
-            self._emit_terminal(handler, task_id, rec["context_id"], state, reply, req_id=req_id)
+            self._stream_existing_task(handler, req_id, task_id, rec["context_id"], agent, rec)
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("A2A: subscribe client disconnected")
 

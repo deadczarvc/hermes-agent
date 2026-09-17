@@ -306,8 +306,12 @@ def _sms_api_key(config: GatewayConfig, sms_config: PlatformConfig) -> None:
 
 def _api_server(config: GatewayConfig) -> None:
     """Require a usable key: an unauthenticated adapter refuses to start and the reconnect watcher would spin."""
+    from gateway.platforms._shared import profile_scoped
+
     key = getenv("API_SERVER_KEY")
     if not _has_usable_api_server_key(key):
+        return
+    if profile_scoped() and Platform.API_SERVER not in config.platforms:
         return
     extra = _enable_from_env(config, Platform.API_SERVER, pop_marker=True, warn=False).extra
     extra["key"] = key
