@@ -33,8 +33,36 @@ def _configured_peers() -> dict:
     return _load_config().get("a2a_agents") or {}
 
 
+def _load_dotenv() -> dict:
+    """Minimal .env reader (Hermes local patch 2026-08-27): workers may run without
+    exported env; a2a_call must still resolve peer.token_env from <hermes_home>/.env."""
+    out: dict[str, str] = {}
+    try:
+        from hermes_constants import get_hermes_home
+        env_path = get_hermes_home() / ".env"
+        if not env_path.exists():
+            return out
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return out
+
+
 def _peer_from_entry(entry: dict, **extra: Any) -> dict:
-    return {"url": entry.get("url", ""), "auth": entry.get("auth", {}) or {},
+    auth = entry.get("auth", {}) or {}
+    # Hermes local patch 2026-08-27: token_env support — a peer may declare
+    # ``token_env: NAME`` instead of an inline token; resolve from process env
+    # with a .env fallback (subprocess children often lack exported vars).
+    if auth.get("type") == "bearer" and not auth.get("token") and entry.get("token_env"):
+        token = os.environ.get(entry["token_env"]) or _load_dotenv().get(entry["token_env"], "")
+        if token:
+            auth = {**auth, "token": token}
+    return {"url": entry.get("url", ""), "auth": auth,
             "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)), **extra}
 
 

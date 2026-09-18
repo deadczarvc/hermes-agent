@@ -2120,6 +2120,22 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     """Fail-closed atomic write for ``config.yaml`` (``require_readable_config_before_write`` first)."""
     require_readable_config_before_write(config_path)
     atomic_yaml_write(config_path, data, **kwargs)
+    _refresh_config_sidecar(config_path)
+
+def _refresh_config_sidecar(config_path: Path) -> None:
+    # Hermes local patch 2026-09-14: sidecar refresh on core config writes.
+    # safe_edit/roster tooling checksum config.yaml via a `.sha256` sidecar
+    # (sha256sum -c format). Every core write path that bypasses safe_edit
+    # (GUI Settings apply, `hermes config set`, plugin writers) must refresh
+    # the sidecar, else integrity watchers cry DIVERGED on legitimate writes.
+    try:
+        import hashlib
+        content = config_path.read_text(encoding="utf-8")
+        sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        sidecar = config_path.with_name(config_path.name + ".sha256")
+        sidecar.write_text(f"{sha}  {config_path.name}\n", encoding="utf-8", newline="\n")
+    except OSError:
+        pass  # sidecar is advisory; a failed refresh must not fail the write
 
 
 def load_config() -> Dict[str, Any]:
