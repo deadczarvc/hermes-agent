@@ -18,11 +18,13 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 import pytest
 
 from tools import lazy_deps as ld
+
 
 # ---------------------------------------------------------------------------
 # Target resolution + gating
@@ -92,22 +94,9 @@ class TestAbiStamp:
     def test_readonly_target_reports_error(self, tmp_path):
         # A path under a non-writable parent should surface a clean error,
         # not raise.
-        # Known Windows limitation (this machine's history): os.chmod(0o500) on
-        # some ACL-roots (F:\Temp) does not make the parent read-only for
-        # admin-elevated processes, so the error contract never trips. Skip
-        # when the chmod is a silent no-op (write probe succeeds).
-        import pytest
         ro_parent = tmp_path / "ro"
         ro_parent.mkdir()
         os.chmod(ro_parent, 0o500)
-        probe = ro_parent / "writability-probe.tmp"
-        try:
-            probe.write_text("x", encoding="utf-8")
-        except OSError:
-            pass  # genuinely read-only: the contract under test holds
-        else:
-            probe.unlink(missing_ok=True)
-            pytest.skip("Windows/ACL: chmod(0o500) did not make the parent read-only; contract not testable here")
         try:
             err = ld._ensure_target_ready(ro_parent / "lazy")
             assert err is not None

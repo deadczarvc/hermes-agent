@@ -999,6 +999,35 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                     scored.append((score, os.path.join(dir_path, f)))
         scored.sort(key=lambda x: -x[0])
         return ReadResult(error=f"File not found: {path}", similar_files=[fp for _, fp in scored[:5]])
+    # Bounded retries for read-class shell commands (auto-patch P4).
+    _READ_RETRY_ATTEMPTS = 3
+
+    def _exec_retry(self, command, attempts=None):
+        tries = max(1, attempts or self._READ_RETRY_ATTEMPTS)
+        result = self._exec(command)
+        for _ in range(tries - 1):
+            if result.exit_code == 0:
+                break
+            result = self._exec(command)
+        return result
+
+    def _py_read_text(self, path):
+        try:
+            raw = Path(path).read_bytes()
+        except FileNotFoundError:
+            return ReadResult(error=f"File not found: {path}")
+        except Exception as exc:
+            return ReadResult(error=f"Failed to read file: {path} ({exc})")
+        if self._is_image(path):
+            return ReadResult(is_image=True, is_binary=True, file_size=len(raw))
+        sample = raw[:1000].decode("utf-8", errors="replace")
+        if self._is_likely_binary(path, sample):
+            return ReadResult(is_binary=True, file_size=len(raw),
+                              error="Binary file")
+        text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+        text, _ = _strip_bom(text)
+        return ReadResult(content=text, file_size=len(raw))
+
 
     def read_file_raw(self, path: str) -> ReadResult:
         """Whole file as a plain string (no pagination/line numbers/clamping)."""
@@ -1015,9 +1044,12 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         is_binary, sample_bytes = self._detect_binary(path)
         if is_binary:
             return ReadResult(is_binary=True, file_size=file_size, error=describe_binary_file(sample_bytes, file_size))
-        cat_result = self._exec(f"cat {self._escape_shell_arg(path)}")
+        cat_result = self._exec_retry(f"cat {self._escape_shell_arg(path)}")
         if cat_result.exit_code != 0:
-            return ReadResult(error=f"Failed to read file: {cat_result.stdout}")
+            fallback = self._py_read_text(path)
+            if fallback.error:
+                return ReadResult(error=f"Failed to read file: {cat_result.stdout}")
+            return fallback
         # Strip a leading BOM (a phantom U+FEFF defeats an exact first-line match);
         # write_file re-probes disk and restores it.
         raw_content, _ = _strip_bom(_strip_terminal_fence_leaks(cat_result.stdout))

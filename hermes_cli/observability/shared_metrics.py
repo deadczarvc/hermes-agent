@@ -160,10 +160,22 @@ def _row_resource(row: sqlite3.Row) -> dict[str, str]:
 
 
 def _ensure_private(path: Path, mode: int) -> None:
-    if mode == 0o700:
-        path.mkdir(parents=True, exist_ok=True, mode=mode)
-    else:
-        path.touch(mode=mode, exist_ok=True)
+    # Hermes local patch 2026-09-16 (shared-metrics-TOCTOU): multi-backend startup races
+    # os.mkdir(WinError 183) -> is_dir() -> stat(WinError 5); path DOES exist => swallow.
+    try:
+        if mode == 0o700:
+            path.mkdir(parents=True, exist_ok=True, mode=mode)
+        else:
+            path.touch(mode=mode, exist_ok=True)
+    except OSError:
+        try:
+            exists = path.is_dir()
+        except OSError:
+            # stat denied (WinError 5) - state unknowable; treat as existing.
+            # Telemetry must never hard-fail a turn (2026-09-17 ACL incident).
+            exists = True
+        if not exists:
+            raise
     try:
         path.chmod(mode)
     except OSError:
