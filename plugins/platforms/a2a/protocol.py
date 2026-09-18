@@ -35,6 +35,10 @@ INPUT_REQUIRED_MARKER = "[INPUT_REQUIRED]"
 # live at -32050..-32059 (implementation-defined space, clear of the A2A block).
 ERR_PARSE, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND = -32700, -32602, -32601
 ERR_TASK_NOT_FOUND, ERR_TASK_NOT_CANCELABLE = -32001, -32002  # A2A spec: TaskNotFoundError / TaskNotCancelableError
+# A2A spec: ContentTypeNotSupportedError. TCK JSONRPC-SSE-002 sends a valid JSON body under
+# `Content-Type: text/plain` and expects this code — a ParseError (-32700) means the body was
+# parsed before the header was checked (restored 2026-09-14 after an update dropped the fix).
+ERR_CONTENT_TYPE_NOT_SUPPORTED = -32005
 ERR_UNAUTHORIZED, ERR_RATE_LIMITED, ERR_UNTRUSTED_PEER = -32050, -32051, -32052
 
 # Anti-loop: max inbound turns per context. A2A_MAX_PINGPONG_TURNS env, capped at 20.
@@ -182,6 +186,17 @@ def extract_context_id(params: dict) -> str:
     return (str(msg.get("contextId") or "") if isinstance(msg, dict) else "") or str(params.get("contextId") or "")
 
 
+def extract_message_id(params: dict) -> str:
+    """Inbound ``Message.messageId`` — the peer's own id for this request (v1.0 keeps it inside the
+    Message; the legacy top-level copy is tolerated, mirroring ``contextId`` above).
+
+    Returns "" when the peer supplied none: an id is never generated here, so such a request keeps
+    the historical behaviour (no invented key, no relaxed validation).
+    """
+    msg = params.get("message") or {}
+    return (str(msg.get("messageId") or "") if isinstance(msg, dict) else "") or str(params.get("messageId") or "")
+
+
 def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", *, created_at: str = "") -> dict:
     """A2A v1.0 Task. ``created_at`` is accepted but NOT serialized: the v1.0 Task proto has no
     createdAt and strict ProtoJSON parsers (a2a-sdk) reject unknown fields."""
@@ -321,12 +336,44 @@ class TaskStore:
         return {"configId": rec.get("push_config_id") or "", "taskId": rec["task_id"],
                 "createdAt": rec.get("created_iso", ""), "pushNotificationConfig": {"url": rec.get("push_url") or ""}}
 
-    def create(self, task_id: str, context_id: str, peer: str, agent_slug: str = "", tenant: str = "") -> dict:
+    def create(self, task_id: str, context_id: str, peer: str, agent_slug: str = "", tenant: str = "",
+               message_id: str = "") -> dict:
+        rec, _created = self.create_or_find_by_message(
+            task_id, context_id, peer, agent_slug, tenant, message_id=message_id
+        )
+        return rec
+
+    def create_or_find_by_message(self, task_id: str, context_id: str, peer: str, agent_slug: str = "",
+                                  tenant: str = "", message_id: str = "") -> tuple[dict, bool]:
+        """Atomically claim ``(peer, message_id, scope)`` or return its existing task."""
         rec = {"task_id": task_id, "context_id": context_id, "peer": peer, "agent_slug": agent_slug or "", "tenant": tenant or "",
-               "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
+               "message_id": str(message_id or ""), "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(),
+               "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
         with self._lock:
+            if message_id:
+                for existing in reversed(self._tasks.values()):
+                    if (existing.get("message_id") == message_id and existing.get("peer") == peer
+                            and existing.get("agent_slug", "") == (agent_slug or "")
+                            and existing.get("tenant", "") == (tenant or "")):
+                        return dict(existing), False
             self._tasks[task_id] = rec
-        return dict(rec)
+            return dict(rec), True
+
+    def find_by_message(self, peer: str, message_id: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+        """Newest stored task that ``peer`` created under ``message_id`` — the idempotency key.
+
+        The key lives on the records themselves (no second index/cache to keep in sync, so a trimmed
+        task can never be replayed through a stale entry). The scan is bounded by ``_MAX_TERMINAL``
+        plus the in-flight tasks, and it is scope-filtered like every other reader. An empty
+        ``message_id`` never matches.
+        """
+        if not message_id:
+            return None
+        with self._lock:
+            for rec in reversed(self._tasks.values()):
+                if rec.get("message_id") == message_id and rec.get("peer") == peer and self._in_scope(rec, agent_slug, tenant):
+                    return dict(rec)
+        return None
 
     def set_state(self, task_id: str, state: str) -> None:
         with self._lock:
