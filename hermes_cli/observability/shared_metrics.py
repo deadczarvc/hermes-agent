@@ -168,6 +168,7 @@ def _ensure_private(path: Path, mode: int) -> None:
         else:
             path.touch(mode=mode, exist_ok=True)
     except OSError:
+<<<<<<< Updated upstream
         try:
             exists = path.is_dir()
         except OSError:
@@ -175,6 +176,11 @@ def _ensure_private(path: Path, mode: int) -> None:
             # Telemetry must never hard-fail a turn (2026-09-17 ACL incident).
             exists = True
         if not exists:
+||||||| Stash base
+        if not (path.is_dir() or path.exists()):
+=======
+        if not path.is_dir():
+>>>>>>> Stashed changes
             raise
 
 
