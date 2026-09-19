@@ -710,7 +710,8 @@ from hermes_cli.config_providers import (  # noqa: E402,F401  (re-exported; call
     apply_custom_provider_tls_to_client_kwargs, coerce_provider_id, find_provider_entry,
     get_compatible_custom_providers, get_custom_provider_context_length,
     get_custom_provider_extra_headers, get_custom_provider_model_capability,
-    get_custom_provider_tls_settings, is_provider_enabled, normalize_extra_headers,
+    get_custom_provider_tls_settings,
+    get_provider_model_context_length, is_provider_enabled, normalize_extra_headers,
     providers_dict_to_custom_providers, stringify_provider_map)
 # Back-compat re-exports — :mod:`hermes_cli.personality` owns personality/overlay semantics.
 from hermes_cli.personality import (  # noqa: E402,F401
