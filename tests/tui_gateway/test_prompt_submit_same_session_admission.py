@@ -85,9 +85,9 @@ def test_concurrent_same_session_submits_admit_one_turn(monkeypatch):
     admissions: list = []
     real_start_inflight = server._start_inflight_turn
 
-    def _record_inflight(target_session, text):
+    def _record_inflight(target_session, text, **kwargs):
         admissions.append(text)
-        real_start_inflight(target_session, text)
+        real_start_inflight(target_session, text, **kwargs)
 
     # Slot claim / persistence / agent build / turn body are NOT the admission boundary
     # under test: they are stubbed so the probe observes the gate itself. The slot claim is

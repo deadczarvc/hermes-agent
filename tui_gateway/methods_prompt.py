@@ -628,27 +628,14 @@ def _(rid, params: dict) -> dict:
         if (t := current_transport()) is not None:
             _attach_session_transport(session, t)
             _cancel_ws_orphan_reap(sid)
-    # Claim the turn against a possibly-running session (busy/queued reply, else claim once
-    # ``running`` is observed False).  The idle observation and the claim MUST share ONE
-    # ``history_lock`` hold: while the lock was released between them, a second submit for
-    # this session could observe the same idle state and claim a SECOND turn — two turn
-    # runners, two pre_llm_call hook runs and duplicate delivery for one prompt.  A submit
-    # that finds the session claimed goes through ``_handle_busy_submit`` (queue/steer/
-    # redirect) instead.  The provider interrupt still happens after history_lock is
-    # released (a non-interruptible tool may hold it); if the old turn finished between the
-    # two acquisitions, ``_handle_busy_submit`` returns None and the loop retries on the
-    # idle session rather than stranding this prompt in a queue whose drain already ran.
-    raw_rebind_ids = params.get("rebind_survivor_row_ids")
-    requested_rebind_ids = (
-        {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
-        if isinstance(raw_rebind_ids, list) else None)
+    # Claim the turn against a possibly-running session (busy/queued reply, else fall
+    # through once ``running`` is observed False).  The provider interrupt happens after
+    # history_lock is released (a non-interruptible tool may hold it); if the old turn
+    # finished between the two acquisitions, retry the claim rather than strand this
+    # prompt in a queue whose drain already ran.
     while True:
         with session["history_lock"]:
             if not session.get("running"):
-                err, survivor_fields = _claim_submit_turn_locked(
-                    rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task)
-                if err is not None:
-                    return err
                 break
             if internal_hosted_submit:
                 return _err(rid, 4091, "hosted room member session is busy")
