@@ -30,6 +30,13 @@ logger = logging.getLogger("tools.skill_manager_tool")
 
 _BATCH_OP_ACTIONS = {"create", "patch", "write_file", "remove_file"}
 _BATCH_MAX_OPS = 20
+_BATCH_TXN_DIRNAME = ".skill-batch-txn"  # Hermes local patch 2026-09-19: constant lost in upstream refactor (NameError on every batch skill_manage)
+# --- Hermes local patch 2026-09-19: batch-liveness/journal globals lost in the same refactor ---
+_JOURNAL_NAME = "transaction.json"
+_LIVE_OWNER_GRACE_S = 120.0
+import threading as _threading
+_ACTIVE_LOCK = _threading.Lock()
+_ACTIVE_BATCHES: set = set()
 
 # --- Per-op argument shape (checked before any effect) ---------------------------------
 # action -> (arg, is_missing, error) checks run before the handler.

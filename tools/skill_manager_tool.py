@@ -32,7 +32,7 @@ from tools.skill_manager_guards import (
     _background_review_preflight, _background_review_read_before_write_guard, _background_review_write_guard,
     _containing_skills_root, _curator_consolidation_delete_guard, _maybe_auto_propose_org_edit,
     _org_mirror_write_guard, _pinned_guard, _validate_delete_target, _is_background_review, _refusal as _err)
-from tools.skill_manager_batch import _skill_manage_batch, _recover_interrupted_batches
+from tools.skill_manager_batch import _op_shape_error, _recover_interrupted_batches, _skill_manage_batch  # Hermes local patch 2026-09-19: _op_shape_error lost from this import in upstream refactor
 from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
 
 logger = logging.getLogger(__name__)
