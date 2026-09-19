@@ -493,24 +493,18 @@ def get_provider_model_context_length(
     model: str,
     config: Optional[Dict[str, Any]] = None,
 ) -> Optional[int]:
-    """Look up a per-model ``context_length`` override from ``providers`` config section.
+    """Per-model ``context_length`` override from ``providers.<name>.models.<model>``.
 
-    Resolves the provider's ``base_url`` from ``config['providers'][provider]``
-    and delegates to :func:`get_custom_provider_context_length`. This is the
-    provider-name-oriented entry point used by the doctor (C14) and model
-    metadata resolver (step 0c).
-
-    Returns ``None`` when no override applies (provider not found, no base_url,
-    or no matching model context_length).
-
-    Hermes local patch (re-applied 2026-08-11 after update-wipe): models-only
-    providers (no base_url, e.g. kimi-coding) return the declared
-    context_length directly from the models block.
+    Hermes local patch (2026-07-31, re-applied 2026-09-19 after update-wipe):
+    checks the provider block's models DIRECTLY first (covers providers with
+    base_url whose models carry context_length), then falls back to route
+    matching via ``get_custom_provider_context_length``.
     """
     if not provider or not model:
         return None
     if config is None:
         try:
+            from hermes_cli.config import load_config
             config = load_config()
         except Exception:
             return None
@@ -520,25 +514,23 @@ def get_provider_model_context_length(
     provider_cfg = providers.get(provider)
     if not isinstance(provider_cfg, dict):
         return None
+    models = provider_cfg.get("models")
+    if isinstance(models, dict):
+        model_cfg = models.get(model)
+        if isinstance(model_cfg, dict):
+            raw = model_cfg.get("context_length")
+            if raw is not None:
+                try:
+                    ctx = int(raw)
+                    if ctx > 0:
+                        return ctx
+                except (TypeError, ValueError):
+                    pass
     base_url = str(provider_cfg.get("base_url") or "").strip()
-    # Models-only override (no route URL): return the declared
-    # context_length directly — the model block is authoritative
-    # even without a route for resolution.
-    if not base_url:
-        models = provider_cfg.get("models")
-        if isinstance(models, dict):
-            model_cfg = models.get(model)
-            if isinstance(model_cfg, dict):
-                raw = model_cfg.get("context_length")
-                if raw is not None:
-                    try:
-                        ctx = int(raw)
-                        if ctx > 0:
-                            return ctx
-                    except (TypeError, ValueError):
-                        pass
-        return None
-    return get_custom_provider_context_length(model, base_url, config=config)
+    if base_url:
+        return get_custom_provider_context_length(model, base_url, config=config)
+    return None
+
 
 
 def get_custom_provider_context_length(
