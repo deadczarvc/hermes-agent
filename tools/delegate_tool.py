@@ -12,6 +12,7 @@ tool calls or reasoning.
 """
 
 import logging
+import os
 import time
 import weakref
 from typing import Any, Dict, List, Optional
@@ -60,6 +61,183 @@ _ROLES = frozenset({"leaf", "orchestrator"})
 
 # Nested delegation is granted by depth/role in _build_child_agent, never by the
 # model naming toolsets (there is no model-facing toolsets argument).
+# ── Structured spec auto-injection for Chinese/Asian LLMs ──────────────────
+# DeepSeek, Kimi, Qwen, GLM, MiniMax, Xiaomi Mimo perform significantly
+# better when task specs use structured XML with explicit MK2 components
+# (Role, Mission, Criteria, Process, Format, Self-Check, Constraints,
+# Positioning) instead of plain-text prose.
+# Consensus-hardened: V1-V6 fixes from 3-position review ported from
+# hooks/lib/structured_spec.py.  Kept inline to avoid core→userland dep.
+
+import re as _re
+from xml.sax.saxutils import escape as _xml_escape
+
+_STRUCTURED_MODEL_PREFIXES: tuple = (
+    "deepseek", "moonshotai/kimi", "kimi", "qwen", "z-ai/glm", "glm",
+    "minimax", "xiaomi/mimo", "mimo", "moonshot",
+)
+
+_STRUCTURED_SPEC_TEMPLATE = (
+    '<task_spec xmlns="urn:hermes:structured-delegation:v1"'
+    ' format="mk2-xml"'
+    ' generated_by="delegate_tool/auto-inject">\n'
+    '\n'
+    '  <role>{role}</role>\n'
+    '\n'
+    '  <mission>{goal}</mission>\n'
+    '\n'
+    '  <criteria>\n'
+    '    <item id="C1">Task completed — all deliverables produced, no stubs</item>\n'
+    '    <item id="C2">Output matches requested format exactly</item>\n'
+    '    <item id="C3">Claims backed by evidence or tagged as hypothesis</item>\n'
+    '    <item id="C4">Edge cases handled (empty input, missing data, errors)</item>\n'
+    '    <item id="C5">Verification performed before claiming completion</item>\n'
+    '  </criteria>\n'
+    '\n'
+    '  <process>\n'
+    '    <step id="P1">Read and understand ALL constraints in mission and context</step>\n'
+    '    <step id="P2">Gather evidence — use tools to observe, do not assume</step>\n'
+    '    <step id="P3">Produce deliverable matching format spec</step>\n'
+    '    <step id="P4">Self-check against ALL criteria before returning</step>\n'
+    '  </process>\n'
+    '\n'
+    '  <format>{fmt}</format>\n'
+    '\n'
+    '  <self_check>\n'
+    '    <check id="S1">All criteria met? If not → fix BEFORE returning.</check>\n'
+    '    <check id="S2">Claims backed by observation (not memory/assumption)?</check>\n'
+    '    <check id="S3">Format matches specification?</check>\n'
+    '    <check id="S4">No fabricated data to fill gaps?</check>\n'
+    '    <check id="S5">Edge cases considered?</check>\n'
+    '  </self_check>\n'
+    '\n'
+    '  <constraints>\n'
+    '    <constraint id="X1">Do NOT fabricate data — use ABSTAIN or state uncertainty</constraint>\n'
+    '    <constraint id="X2">Do NOT claim system state without observation or hypothesis tag</constraint>\n'
+    '    <constraint id="X3">Do NOT change answer unless concrete error with location is found</constraint>\n'
+    '    <constraint id="X4">Structure output: facts → actions → verification → risks</constraint>\n'
+    '  </constraints>\n'
+    '\n'
+    '  <positioning>\n'
+    '    PRIORITY: Task ≻ Evidence ≻ Protocol ≻ Role ≻ Style.\n'
+    '    Success = ALL criteria met with verifiable evidence.\n'
+    '  </positioning>\n'
+    '\n'
+    '</task_spec>'
+)
+
+# Role detection patterns — match on goal keywords
+_ROLE_PATS: tuple = (
+    (r'(?i)\b(debug|fix|bug|error|crash|traceback)\b', "Debugging specialist"),
+    (r'(?i)\b(review|audit|security|vuln)\b', "Code reviewer / security auditor"),
+    (r'(?i)\b(research|investigate|analyze|survey|study)\b', "Research analyst"),
+    (r'(?i)\b(refactor|rewrite|restructure|clean)\b', "Code refactoring specialist"),
+    (r'(?i)\b(implement|build|create|develop|write code)\b', "Software engineer"),
+    (r'(?i)\b(test|coverage|unit test|integration test)\b', "Test engineer"),
+    (r'(?i)\b(document|write docs|README|explain)\b', "Technical writer"),
+    (r'(?i)\b(architect|design|plan|blueprint)\b', "System architect"),
+    (r'(?i)\b(deploy|release|publish|CI|CD)\b', "DevOps engineer"),
+    (r'(?i)\b(data|statistics|ML|train)\b', "Data scientist / ML engineer"),
+)
+
+# Format detection patterns — match on output/return context
+_FMT_PATS: tuple = (
+    (r'(?:output|return|respond|format)\s+(?:as|in|with)\s+json\b', "JSON — all fields typed, no trailing commas, valid syntax"),
+    (r'(?:output|return|respond|format)\s+(?:as|in|with)\s+yaml\b', "YAML — proper indentation, no tabs, valid syntax"),
+    (r'(?:output|return|respond|format)\s+(?:as|in|with)\s+markdown\b', "Markdown — headers, lists, code blocks with language tags"),
+    (r'\bjson\b', "JSON — all fields typed, no trailing commas, valid syntax"),
+    (r'\byaml\b', "YAML — proper indentation, no tabs, valid syntax"),
+    (r'\bmarkdown\b|\\.md\b', "Markdown — headers, lists, code blocks with language tags"),
+    (r'\bpython\b|\\.py\b|script\b', "Python code — typed, docstring, runnable, no placeholders"),
+    (r'\btable\b|csv\b|spreadsheet\b', "Tabular data — columns labeled, consistent types per column"),
+    (r'\bdiagram\b|mermaid\b|architecture\b', "Mermaid diagram or architecture description"),
+)
+
+_MIN_SPEC_GOAL_WORDS = 6
+
+def _is_structured_model(model: str) -> bool:
+    """Check if model belongs to a family that benefits from structured specs."""
+    if not model:
+        return False
+    # Normalize: strip provider prefix (e.g. "deepseek/deepseek-v4" → "deepseek-v4")
+    normalized = model.lower()
+    if "/" in normalized:
+        parts = normalized.split("/")
+        if len(parts) >= 2 and _re.match(r"^[a-z][a-z0-9_-]*$", parts[0]):
+            normalized = "/".join(parts[1:])
+    for prefix in _STRUCTURED_MODEL_PREFIXES:
+        pl = prefix.lower()
+        # F3-fix: use startswith only — 'in' matching causes false positives
+        # (e.g. "claude-with-kimi-style" would match "kimi" via substring)
+        if normalized.startswith(pl):
+            return True
+    return False
+
+
+def _generate_structured_spec(goal: str, context: str = "") -> str | None:
+    """Generate <task_spec> XML block for Chinese/Asian LLM delegation.
+
+    Returns the injection string to prepend to context, or None if the
+    goal is too short (<6 words) or already contains structured markup.
+    """
+    # Escape hatch: set HERMES_DISABLE_STRUCTURED_SPEC=1 to disable injection
+    # globally (mirrors hooks/lib/structured_spec.py L386).
+    if os.environ.get("HERMES_DISABLE_STRUCTURED_SPEC"):
+        return None
+    # F1-fix: truncate inputs to prevent OOM on oversized goals/contexts
+    _MAX_GOAL_CHARS = 2000
+    _MAX_CONTEXT_CHARS = 32000
+    goal = (goal or "").strip()[:_MAX_GOAL_CHARS]
+    if not goal or len(goal.split()) < _MIN_SPEC_GOAL_WORDS:
+        return None
+    ctx = (context or "")[:_MAX_CONTEXT_CHARS]
+    # F2-fix: strip null bytes and C0 control characters before processing
+    goal = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', goal)
+    ctx = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', ctx)
+    # Guard: don't double-wrap already-structured tasks
+    combined = goal + "\n" + ctx
+    if _re.search(r'<task_spec\s+xmlns=', combined, _re.IGNORECASE):
+        return None
+
+    # Auto-detect role hint
+    matches = []
+    for pat, role in _ROLE_PATS:
+        if _re.search(pat, combined):
+            matches.append(role)
+    role_hint = (
+        f"{matches[0]} + {matches[1]}" if len(matches) >= 2
+        else matches[0] if matches
+        else "Task execution specialist — follow mission and criteria exactly"
+    )
+
+    # Auto-detect format hint
+    fmt_hint = "Plain text with clear section headings — no format constraints"
+    for pat, fmt in _FMT_PATS:
+        if _re.search(pat, combined, _re.IGNORECASE):
+            fmt_hint = fmt
+            break
+
+    # Build spec with XML-safe escaping
+    spec = (_STRUCTURED_SPEC_TEMPLATE
+        .replace("{goal}", _xml_escape(goal))
+        .replace("{role}", _xml_escape(role_hint))
+        .replace("{fmt}", _xml_escape(fmt_hint))
+    )
+
+    # Truncate preserving XML well-formedness
+    max_chars = 6000
+    if len(spec) > max_chars:
+        cutoff = max_chars - 200
+        last_close = spec.rfind('</', 0, cutoff)
+        if last_close == -1:
+            spec = spec[:cutoff] + '\n<!-- TRUNCATED -->\n</task_spec>'
+        else:
+            tag_end = spec.find('>', last_close)
+            spec = spec[:tag_end + 1] + '\n<!-- TRUNCATED -->\n</task_spec>'
+
+    return spec
+
+
 def _normalize_role(r: Optional[str]) -> str:
     """'leaf' | 'orchestrator'; None/empty/unknown -> 'leaf' (unknown warns)."""
     r_norm = str(r).strip().lower() if r else "leaf"
@@ -198,6 +376,45 @@ def _build_child_agent(
     # General delegation behavior (reasoning, compression, capabilities) stays
     # global. Only fallback policy follows the owner of a per-call route such
     # as auxiliary.review.
+    # ── Structured spec auto-injection for Chinese/Asian LLMs ──────────
+    # DeepSeek, Kimi, Qwen, GLM, MiniMax, Xiaomi Mimo perform significantly
+    # better with structured XML task specs (MK2: Role→Mission→Criteria→
+    # Process→Format→SelfCheck→Constraints→Positioning).  Auto-inject a
+    # <task_spec> block into the subagent context so parent callers don't
+    # need to call wrap_for_model() manually.
+    #
+    # TRACING: set HERMES_TRACE_STRUCTURED_SPEC=1 for per-delegation logs.
+    # Logs model, injection decision, spec size, and goal preview.
+    _resolved_model = model or getattr(parent_agent, "model", None)
+    _spec_injected = False
+    try:
+        if _resolved_model and _is_structured_model(_resolved_model):
+            # XTML card already present in context? (layer-N notation, strict
+            # marker pair: opening task tag + closing task tag). If yes, the
+            # caller already structured the delegation — skip XML re-wrapping
+            # to avoid dual-authority duplication (consensus V7, DESIGN
+            # XTML-HERMES v1.1). Cheap inline detection; full validation is
+            # the author's step (xtml-validate-hermes.py / validate.py).
+            _ctx_for_xtml = context or ""
+            _has_xtml = (
+                ("[open]task" in _ctx_for_xtml and "[sep]" in _ctx_for_xtml)
+                and ("[close]task[sep]" in _ctx_for_xtml)
+            )
+            if not _has_xtml:
+                _spec = _generate_structured_spec(goal=goal, context=_ctx_for_xtml)
+                if _spec:
+                    context = _ctx_for_xtml + "\n\n" + _spec + "\n"
+                    _spec_injected = True
+    except Exception:
+        pass  # F5-fix: fail-open — delegation proceeds without spec
+    if os.environ.get("HERMES_TRACE_STRUCTURED_SPEC"):
+        _goal_preview = (goal or "")[:80].replace("\n", " ")
+        _decision = "injected" if _spec_injected else ("structured_model" if (_resolved_model and _is_structured_model(_resolved_model)) else "skipped")
+        logger.debug(
+            "structured_spec: model=%s decision=%s goal=%r",
+            _resolved_model, _decision, _goal_preview,
+        )
+
     delegation_cfg = _load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
     child_prompt = _build_child_system_prompt(

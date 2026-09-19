@@ -2086,6 +2086,18 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     """Fail-closed atomic write for ``config.yaml`` (``require_readable_config_before_write`` first)."""
     require_readable_config_before_write(config_path)
     atomic_yaml_write(config_path, data, **kwargs)
+    _refresh_config_sidecar(config_path)
+
+
+def _refresh_config_sidecar(config_path: Path) -> None:
+    """Update the ``.sha256`` sidecar after an atomic config write (station patch)."""
+    import hashlib
+    sidecar = config_path.parent / (config_path.name + ".sha256")
+    try:
+        digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
+        sidecar.write_text(f"{digest}\n", encoding="utf-8")
+    except OSError:
+        pass  # sidecar update is best-effort
 
 
 def load_config() -> Dict[str, Any]:

@@ -196,6 +196,12 @@ VALID_HOOKS: Set[str] = {
     # IGNORED in v1 — a plugin returning a directive-shaped dict gets a debug log so future block/rewrite
     # adopters are discoverable once the middleware variant ships against the #64231 taxonomy.
     "pre_command",
+    # select_tool_schemas: once per API request AFTER tool schemas are assembled, BEFORE the
+    # request is built. Kwargs: user_message, conversation_history, schemas (current full list),
+    # model, platform, provider, session_id. Return None (keep) or a filtered list[dict] in the
+    # same schema shape; the trimmed list applies to THIS request only (agent.tools is never
+    # mutated). Selectors chain: each receives the previous selector output.
+    "select_tool_schemas",
 }
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
@@ -917,6 +923,19 @@ class PluginContext:
         """Register a lifecycle hook callback (unknown names warn but are still stored)."""
         return self._track_callback("hook", hook_name, callback, self._manager._hooks, VALID_HOOKS)
 
+    def register_tool_schema_selector(self, callback: Callable) -> PluginRegistration:
+        """Register a tool-schema selector called once per API request.
+
+        Kwargs: user_message, conversation_history, schemas, model, platform, provider,
+        session_id. Return None (keep the list) or a filtered list[dict] in the same
+        schema shape; selectors chain in registration order and the final list applies
+        to this request only - ``agent.tools`` is never mutated.
+        """
+        return self._track_callback(
+            "select_tool_schemas", "select_tool_schemas", callback,
+            self._manager._hooks, VALID_HOOKS,
+        )
+
     def register_middleware(self, kind: str, callback: Callable) -> PluginRegistration:
         """Register behavior-changing middleware (request kinds rewrite the payload, execution kinds
         wrap the callback). Unknown kinds warn but are stored."""
@@ -932,7 +951,7 @@ class PluginContext:
         if key not in valid:
             logger.warning("Plugin '%s' registered unknown %s '%s' (valid: %s)", self.manifest.name, kind,
                            key, ", ".join(sorted(valid)))
-        mapping.setdefault(key, []).append(callback)
+        self._manager._append_callback(mapping, key, callback)
         handle = self._track(kind, key, lambda: self._manager._remove_callback(mapping, key, callback))
         logger.debug("Plugin %s registered %s: %s", self.manifest.name, kind, key)
         return handle
@@ -1150,6 +1169,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # (matcher, callback, plugin_name), platform handler factories (lowercase platform -> list).
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        # Tool-schema selectors (select_tool_schemas hook): chained per API request.
         # Fallback hooks registered by a memory provider before general discovery.
         self._memory_hook_registrations: Dict[Tuple[str, str], List[PluginRegistration]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
@@ -1177,10 +1197,13 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # In-flight / recently-timed-out hook callbacks keyed by (hook_name, id(cb), call_identity)
         # so a stuck policy hook cannot spawn a new abandoned thread on every fire.
         self._hook_running_callbacks: Dict[tuple, object] = {}
+        self._hook_running_identities: Dict[tuple, object] = {}
         self._hook_abandoned: Dict[tuple, set] = {}
         self._hook_timeout_suppressed_until: Dict[tuple, float] = {}
         self._hook_timeout_lock = threading.Lock()
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
+        self._hook_registration_lifetimes: Dict[tuple, Dict[str, int]] = {}
+        self._hook_registration_epoch = 0
         # (hook_name, id(cb), repr(exc)) already reported at WARNING; identical repeats go to DEBUG.
         self._hook_failures_reported: set = set()
         # Ledger per plugin (ownership) plus global order (reverse teardown across plugins). Process-

@@ -100,6 +100,12 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     cc = getattr(agent, "context_compressor", None)
     if cc is None:
         return
+    # Hermes local patch 2026-09-19: context-engine plugins (e.g. JevEngine) own their compaction
+    # policy (agent_init never applies host thresholds to them); the in-place live sync must
+    # respect the same boundary or it crashes on missing ContextCompressor internals.
+    from agent.context_compressor import ContextCompressor as _CC
+    if not isinstance(cc, _CC):
+        return
     # tail_mode: unknown/absent values land on the ctor default ("lean"), matching agent_init.
     default_tail = str(_compressor_ctor_default("tail_mode", "lean"))
     mode = str(compression.get("tail_mode", default_tail) or default_tail).strip().lower()

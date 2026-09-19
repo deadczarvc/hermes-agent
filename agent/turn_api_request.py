@@ -114,6 +114,27 @@ def build_api_request(
             tools_for_api=tools_for_api,
         )
     )
+    # select_tool_schemas: plugin chain may trim the per-request tool list. Runs AFTER the
+    # prompt-cache re-decoration (messages untouched) and BEFORE kwargs are built; the trim
+    # applies to THIS request only - agent.tools is never mutated. Chain semantics: each
+    # selector receives the previous output; a None return keeps the incoming list.
+    try:
+        from hermes_cli.plugins import invoke_hook
+        _sel_results = invoke_hook(
+            "select_tool_schemas",
+            user_message=getattr(agent, "_current_user_message", "") or "",
+            conversation_history=None,
+            schemas=list(tools_for_api or []),
+            model=getattr(agent, "model", "") or "",
+            platform=getattr(agent, "platform", "") or "",
+            provider=getattr(agent, "provider", None),
+            session_id=getattr(agent, "session_id", None),
+        )
+        for _r in _sel_results:
+            if isinstance(_r, list) and _r:
+                tools_for_api = _r
+    except Exception:
+        pass  # selector failure must never break the API request (fail-open)
     if tools_for_api == agent.tools:
         api_kwargs = agent._build_api_kwargs(api_messages)
     else:
