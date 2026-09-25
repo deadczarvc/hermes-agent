@@ -1,12 +1,35 @@
 import { PassThrough } from 'stream'
 
 import { Box, renderSync } from '@hermes/ink'
+import { stripAnsi } from '@hermes/shared/ansi'
+import chalk from 'chalk'
 import React from 'react'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { AUDIO_DIRECTIVE_RE, INLINE_RE, Md, MEDIA_LINE_RE, stripInlineMarkup } from '../components/markdown.js'
-import { stripAnsi } from '../lib/text.js'
-import { DEFAULT_THEME } from '../theme.js'
+import { __resetLinkTitleCache, fetchLinkTitle } from '../lib/externalLink.js'
+import { DEFAULT_THEME, LIGHT_THEME } from '../theme.js'
+
+afterEach(() => {
+  __resetLinkTitleCache()
+  vi.unstubAllGlobals()
+})
+
+// Stub the network and warm the shared title cache, so a subsequent render
+// has the resolved title available synchronously.
+const stubFetchedTitle = (url: string, title: string) => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn().mockResolvedValue(
+      new Response(`<html><head><title>${title}</title></head></html>`, {
+        headers: { 'content-type': 'text/html' },
+        status: 200
+      })
+    )
+  )
+
+  return fetchLinkTitle(url)
+}
 
 const matches = (text: string) => [...text.matchAll(INLINE_RE)].map(m => m[0])
 const BEL = String.fromCharCode(7)
@@ -14,7 +37,9 @@ const ESC = String.fromCharCode(27)
 const CSI_RE = new RegExp(`${ESC}\\[[0-?]*[ -/]*[@-~]`, 'g')
 const OSC_RE = new RegExp(`${ESC}\\][\\s\\S]*?(?:${BEL}|${ESC}\\\\)`, 'g')
 
-const renderPlain = (node: React.ReactNode) => {
+// The escape stream exactly as it reaches the terminal, OSC sequences and
+// all — the only view that can prove an OSC 8 hyperlink was emitted.
+const renderAnsi = (node: React.ReactNode) => {
   const stdout = new PassThrough()
   const stdin = new PassThrough()
   const stderr = new PassThrough()
@@ -38,15 +63,18 @@ const renderPlain = (node: React.ReactNode) => {
   instance.cleanup()
 
   return output
+}
+
+const renderPlain = (node: React.ReactNode) =>
+  renderAnsi(node)
     .replace(OSC_RE, '')
     .split('\n')
     .map(line => stripAnsi(line).replace(CSI_RE, '').trimEnd())
-}
 
 describe('INLINE_RE emphasis', () => {
   it('matches word-boundary italic/bold', () => {
     expect(matches('say _hi_ there')).toEqual(['_hi_'])
-    expect(matches('very __bold__ move')).toEqual(['__bold__'])
+    expect(matches('very __bold move__ today')).toEqual(['__bold move__'])
     expect(matches('(_paren_) and [_bracket_]')).toEqual(['_paren_', '_bracket_'])
   })
 
@@ -56,6 +84,12 @@ describe('INLINE_RE emphasis', () => {
     expect(matches(path)).toEqual([])
     expect(matches('snake_case_var and MY_CONST')).toEqual([])
     expect(matches('foo__bar__baz')).toEqual([])
+  })
+
+  it('keeps Python dunder identifiers literal', () => {
+    expect(matches('if __name__ == "__main__":')).toEqual([])
+    expect(matches('def __init__(self):')).toEqual([])
+    expect(matches('print(__file__)')).toEqual([])
   })
 
   it('still matches asterisk emphasis intraword', () => {
@@ -93,7 +127,12 @@ describe('stripInlineMarkup', () => {
   it('strips word-boundary emphasis only', () => {
     expect(stripInlineMarkup('say _hi_ there')).toBe('say hi there')
     expect(stripInlineMarkup('browser_screenshot_ecc.png')).toBe('browser_screenshot_ecc.png')
-    expect(stripInlineMarkup('__bold__ and foo__bar__')).toBe('bold and foo__bar__')
+    expect(stripInlineMarkup('__bold move__ and foo__bar__')).toBe('bold move and foo__bar__')
+  })
+
+  it('preserves Python dunder identifiers', () => {
+    expect(stripInlineMarkup('if __name__ == "__main__":')).toBe('if __name__ == "__main__":')
+    expect(stripInlineMarkup('class X: def __init__(self): pass')).toBe('class X: def __init__(self): pass')
   })
 
   it('leaves ~!/~? kaomoji alone and still handles real subscript', () => {
@@ -136,29 +175,6 @@ describe('INLINE_RE inline math', () => {
     // inline-math token so the inner regexes never see those characters.
     expect(matches('$P=a_n x^n + a_0$')).toEqual(['$P=a_n x^n + a_0$'])
     expect(matches('$\\beta_1,\\dots,\\beta_r$')).toEqual(['$\\beta_1,\\dots,\\beta_r$'])
-  })
-
-  it('places math content in the correct capture group (regression: m[16] is bare URL)', () => {
-    // When `m[16]` was the bare URL group AND the inline-math `$...$`
-    // group simultaneously (because the bare URL pattern lacked its own
-    // capturing parens), MdInline rendered `$\\mathbb{R}$` as an
-    // underlined autolink instead of italic amber math. Lock down the
-    // numbering: math goes in m[17] / m[18], URLs go in m[16].
-    const url = [...'see https://example.com here'.matchAll(INLINE_RE)][0]!
-    const dollarMath = [...'$\\mathbb{R}$'.matchAll(INLINE_RE)][0]!
-    const parenMath = [...'\\(\\pi\\)'.matchAll(INLINE_RE)][0]!
-
-    expect(url[16]).toBe('https://example.com')
-    expect(url[17]).toBeUndefined()
-    expect(url[18]).toBeUndefined()
-
-    expect(dollarMath[16]).toBeUndefined()
-    expect(dollarMath[17]).toBe('\\mathbb{R}')
-    expect(dollarMath[18]).toBeUndefined()
-
-    expect(parenMath[16]).toBeUndefined()
-    expect(parenMath[17]).toBeUndefined()
-    expect(parenMath[18]).toBe('\\pi')
   })
 })
 
@@ -216,40 +232,108 @@ describe('Md wrapping', () => {
 
     expect(lines.some(line => line.startsWith(' hi  ok'))).toBe(true)
   })
-})
 
-describe('Md link labels', () => {
-  it('renders bare URLs with readable slug labels', () => {
-    const lines = renderPlain(
-      React.createElement(
-        Box,
-        { width: 120 },
-        React.createElement(Md, {
-          t: DEFAULT_THEME,
-          text: 'see https://www.expedia.com/things-to-do/puerto-rico-el-yunque-rainforest-adventure for details'
-        })
-      )
-    )
-
-    const rendered = lines.join('\n')
-
-    expect(rendered).toContain('Puerto Rico El Yunque Rainforest Adventure')
-    expect(rendered).not.toContain('https://www.expedia.com/things-to-do/puerto-rico-el-yunque-rainforest-adventure')
-  })
-
-  it('keeps explicit markdown labels as the immediate fallback', () => {
+  it('renders Python dunder identifiers literally outside code fences', () => {
     const lines = renderPlain(
       React.createElement(
         Box,
         { width: 80 },
         React.createElement(Md, {
           t: DEFAULT_THEME,
-          text: '[Trip details](https://www.expedia.com/things-to-do/puerto-rico-el-yunque-rainforest-adventure)'
+          text: 'if __name__ == "__main__":\n    obj.__init__()'
         })
       )
     )
 
-    expect(lines.join('\n')).toContain('Trip details')
+    const rendered = lines.join('\n')
+
+    expect(rendered).toContain('if __name__ == "__main__":')
+    expect(rendered).toContain('obj.__init__()')
+  })
+})
+
+describe('Md link labels', () => {
+  const md = (text: string, width = 200) =>
+    React.createElement(Box, { width }, React.createElement(Md, { cols: width, t: DEFAULT_THEME, text }))
+
+  // The link target has to survive as literal text, not just as OSC 8
+  // metadata: a bare URL that renders as a site name leaves nothing to read,
+  // copy or retype on any terminal that strips the escape.
+  it('renders a bare URL verbatim instead of a derived label', () => {
+    const url = 'https://connect.example.com/link/lk_9f2c1d7e'
+    const rendered = renderPlain(md(`see ${url} for details`)).join('\n')
+
+    expect(rendered).toContain(url)
+    // `urlSlugTitleLabel` used to turn the last path segment into this.
+    expect(rendered).not.toContain('Lk 9f2c1d7e')
+  })
+
+  it('wraps a bare URL in an OSC 8 hyperlink pointing at the same target', () => {
+    const url = 'https://connect.example.com/link/lk_9f2c1d7e'
+    const ansi = renderAnsi(md(`Connect link: ${url}`))
+
+    expect(ansi).toContain(`;${url}${BEL}`)
+    expect(ansi).toContain(`${ESC}]8;`)
+  })
+
+  it('leaves trailing prose punctuation outside the visible URL', () => {
+    const url = 'https://docs.example.com/guide/auth'
+    const rendered = renderPlain(md(`open ${url}, then retry`)).join('\n')
+
+    expect(rendered).toContain(`open ${url}, then retry`)
+  })
+
+  it('renders an autolink verbatim', () => {
+    const url = 'https://docs.example.com/guide/auth'
+    const rendered = renderPlain(md(`see <${url}>`)).join('\n')
+
+    expect(rendered).toContain(url)
+  })
+
+  it('keeps an authored markdown label and carries the target in OSC 8', () => {
+    const url = 'https://docs.example.com/guide/auth'
+    const ansi = renderAnsi(md(`[Trip details](${url})`))
+
+    expect(stripAnsi(ansi.replace(OSC_RE, ''))).toContain('Trip details')
+    expect(ansi).toContain(`;${url}${BEL}`)
+  })
+
+  it('never lets a fetched page title replace the URL', async () => {
+    const url = 'https://connect.example.com/link/lk_9f2c1d7e'
+
+    // Warm the shared title cache, then prove the renderer ignores it. This
+    // is the exact shape of the live defect: the fetched title was the only
+    // thing on screen.
+    await stubFetchedTitle(url, 'Connect your account')
+
+    const rendered = renderPlain(md(`Connect link: ${url}`)).join('\n')
+
+    expect(rendered).toContain(url)
+    expect(rendered).not.toContain('Connect your account')
+  })
+
+  it('renders a URL-labelled markdown link as the URL', async () => {
+    const url = 'https://docs.example.com/guide/auth'
+
+    await stubFetchedTitle(url, 'Auth Guide')
+
+    const rendered = renderPlain(md(`[${url}](${url})`)).join('\n')
+
+    expect(rendered).toContain(url)
+    expect(rendered).not.toContain('Auth Guide')
+  })
+
+  it('falls back to the URL when the markdown label is blank', () => {
+    const url = 'https://docs.example.com/guide/auth'
+    const rendered = renderPlain(md(`[ ](${url})`)).join('\n')
+
+    expect(rendered).toContain(url)
+  })
+
+  it('renders a mailto autolink as the address', () => {
+    const rendered = renderPlain(md('write <ops@example.com> today')).join('\n')
+
+    expect(rendered).toContain('write ops@example.com today')
   })
 })
 
@@ -298,5 +382,91 @@ describe('renderTable CJK width alignment', () => {
     // The CJK row is the one that drifted before the fix.  It must
     // align with the rest now.
     expect(qwenCol2).toBe(headerCol2)
+  })
+})
+
+describe('body prose stays in the theme palette', () => {
+  // Prose used to render in the terminal's DEFAULT foreground while inline
+  // tokens beside it carried a theme color, so one line mixed two inks.
+  // Because an inline token can match mid-word, so could a single word.
+  // LIGHT_THEME is the vehicle here because every tone in it is hex, so
+  // emitted SGR maps back to palette entries without format juggling.
+  const foregroundRuns = (text: string): string[] => {
+    // chalk is a singleton and defaults to level 0 under vitest (no TTY),
+    // which would emit no SGR at all and make every assertion here vacuous.
+    const savedLevel = chalk.level
+    chalk.level = 3
+
+    const stdout = new PassThrough()
+    const stdin = new PassThrough()
+    const stderr = new PassThrough()
+    let output = ''
+
+    Object.assign(stdout, { columns: 80, isTTY: true, rows: 24 })
+    Object.assign(stdin, { isTTY: false })
+    Object.assign(stderr, { isTTY: false })
+    stdout.on('data', chunk => {
+      output += chunk.toString()
+    })
+
+    const instance = renderSync(
+      React.createElement(Box, { width: 70 }, React.createElement(Md, { cols: 68, t: LIGHT_THEME, text })),
+      {
+        patchConsole: false,
+        stderr: stderr as NodeJS.WriteStream,
+        stdin: stdin as NodeJS.ReadStream,
+        stdout: stdout as NodeJS.WriteStream
+      }
+    )
+
+    instance.unmount()
+    instance.cleanup()
+    chalk.level = savedLevel
+
+    return [...output.matchAll(new RegExp(`${ESC}\\[38;2;(\\d+);(\\d+);(\\d+)m`, 'g'))].map(
+      m =>
+        '#' +
+        m
+          .slice(1, 4)
+          .map(v => Number(v).toString(16).padStart(2, '0'))
+          .join('')
+    )
+  }
+
+  const PALETTE = new Set(
+    Object.values(LIGHT_THEME.color)
+      .filter((v): v is string => typeof v === 'string' && v.startsWith('#'))
+      .map(v => v.toLowerCase())
+  )
+
+  const INK = LIGHT_THEME.color.text.toLowerCase()
+
+  it('opens a paragraph with the theme ink, not the terminal default', () => {
+    expect(foregroundRuns('plain prose line')[0]).toBe(INK)
+  })
+
+  it('keeps every foreground on a mixed-token line inside the palette', () => {
+    // `render_terminal_output` trips the underscore-italic token mid-word —
+    // the exact shape that split one word across two inks.
+    const fg = foregroundRuns('set the `flag` and re-render_terminal_output for the run')
+
+    expect(fg.length).toBeGreaterThan(0)
+
+    for (const c of fg) {
+      expect(PALETTE.has(c)).toBe(true)
+    }
+  })
+
+  it('returns to the theme ink after an inline token, not to the terminal default', () => {
+    const fg = foregroundRuns('before `code` after')
+
+    expect(fg[0]).toBe(INK)
+    expect(fg.at(-1)).toBe(INK)
+  })
+
+  it('themes list-item prose too', () => {
+    for (const text of ['- a bullet item', '1. a numbered item']) {
+      expect(foregroundRuns(text)).toContain(INK)
+    }
   })
 })

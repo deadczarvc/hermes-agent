@@ -15,7 +15,6 @@ History:
 
 from __future__ import annotations
 
-import io
 import json
 from typing import Any, Dict
 from urllib.parse import parse_qs, urlparse
@@ -53,6 +52,13 @@ def _patch_oauth_flow(
         return True
 
     monkeypatch.setattr("webbrowser.open", fake_open)
+    # The flow now gates webbrowser.open() behind a graphical-browser check so
+    # it never launches a console browser (w3m/lynx) inside the terminal. Tests
+    # run headless, so force the GUI path to True — the URL capture relies on
+    # webbrowser.open() being invoked.
+    monkeypatch.setattr(
+        "hermes_cli.auth._can_open_graphical_browser", lambda: True
+    )
     monkeypatch.setattr("builtins.input", lambda *_a, **_kw: callback_code)
 
     class _FakeResponse:
@@ -114,7 +120,7 @@ def test_authorization_url_state_is_not_pkce_verifier(monkeypatch, tmp_path):
 
     monkeypatch.setattr(builtins, "input", fake_input)
 
-    from agent.anthropic_adapter import run_hermes_oauth_login_pure
+    from agent.anthropic_credentials import run_hermes_oauth_login_pure
 
     result = run_hermes_oauth_login_pure()
     assert result is not None, "OAuth flow should succeed with matching state"
@@ -142,6 +148,10 @@ def test_authorization_url_state_is_not_pkce_verifier(monkeypatch, tmp_path):
     )
 
 
+
+
+
+
 def test_callback_state_mismatch_aborts(monkeypatch, tmp_path, caplog):
     """If the state returned in the callback does not match the one we sent
     in the authorization URL, the flow must abort before exchanging the code.
@@ -160,7 +170,7 @@ def test_callback_state_mismatch_aborts(monkeypatch, tmp_path, caplog):
         capture_token_request=captured_token,
     )
 
-    from agent.anthropic_adapter import run_hermes_oauth_login_pure
+    from agent.anthropic_credentials import run_hermes_oauth_login_pure
 
     result = run_hermes_oauth_login_pure()
 

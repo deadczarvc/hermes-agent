@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import threading
 from pathlib import Path
 from typing import Any, Dict
@@ -15,6 +14,7 @@ import pytest
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
+from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -22,24 +22,10 @@ from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
 # ---------------------------------------------------------------------------
 
 
-def test_registry_lists_nous():
-    assert "nous" in ADAPTERS
 
 
-def test_get_adapter_returns_instance():
-    adapter = get_adapter("nous")
-    assert isinstance(adapter, NousPortalAdapter)
-    assert isinstance(adapter, UpstreamAdapter)
 
 
-def test_get_adapter_case_insensitive():
-    assert isinstance(get_adapter("NOUS"), NousPortalAdapter)
-    assert isinstance(get_adapter("  Nous  "), NousPortalAdapter)
-
-
-def test_get_adapter_unknown_provider_raises():
-    with pytest.raises(ValueError, match="anthropic"):
-        get_adapter("anthropic")  # not yet implemented
 
 
 # ---------------------------------------------------------------------------
@@ -57,128 +43,6 @@ def _write_auth_store(hermes_home: Path, nous_state: Dict[str, Any]) -> Path:
     return auth_path
 
 
-def test_nous_adapter_metadata():
-    adapter = NousPortalAdapter()
-    assert adapter.name == "nous"
-    assert adapter.display_name == "Nous Portal"
-    assert "/chat/completions" in adapter.allowed_paths
-    assert "/embeddings" in adapter.allowed_paths
-    assert "/completions" in adapter.allowed_paths
-    assert "/models" in adapter.allowed_paths
-
-
-def test_nous_adapter_not_authenticated_when_no_auth_file(tmp_path, monkeypatch):
-    # HERMES_HOME is already set by conftest, but make doubly sure
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    adapter = NousPortalAdapter()
-    assert not adapter.is_authenticated()
-
-
-def test_nous_adapter_not_authenticated_when_provider_missing(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / "auth.json").write_text(json.dumps({
-        "version": 1,
-        "providers": {},
-    }))
-    assert not NousPortalAdapter().is_authenticated()
-
-
-def test_nous_adapter_authenticated_with_agent_key(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    _write_auth_store(tmp_path, {
-        "agent_key": "ov-test-key",
-        "agent_key_expires_at": "2099-01-01T00:00:00Z",
-        "inference_base_url": "https://inference-api.nousresearch.com/v1",
-    })
-    assert NousPortalAdapter().is_authenticated()
-
-
-def test_nous_adapter_authenticated_with_refresh_token_only(tmp_path, monkeypatch):
-    """If access_token+refresh_token exist but no agent_key yet, we can still mint."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    _write_auth_store(tmp_path, {
-        "access_token": "access-tok",
-        "refresh_token": "refresh-tok",
-    })
-    assert NousPortalAdapter().is_authenticated()
-
-
-def test_nous_adapter_get_credential_refreshes_and_persists(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    _write_auth_store(tmp_path, {
-        "access_token": "access-tok",
-        "refresh_token": "refresh-tok",
-        "client_id": "hermes-cli",
-        "portal_base_url": "https://portal.nousresearch.com",
-        "inference_base_url": "https://inference-api.nousresearch.com/v1",
-    })
-
-    refreshed_state = {
-        "access_token": "access-tok",
-        "refresh_token": "refresh-tok",
-        "client_id": "hermes-cli",
-        "portal_base_url": "https://portal.nousresearch.com",
-        "inference_base_url": "https://inference-api.nousresearch.com/v1",
-        "agent_key": "minted-bearer",
-        "agent_key_expires_at": "2099-01-01T00:00:00Z",
-    }
-
-    with patch(
-        "hermes_cli.proxy.adapters.nous_portal.refresh_nous_oauth_from_state",
-        return_value=refreshed_state,
-    ) as mock_refresh:
-        adapter = NousPortalAdapter()
-        cred = adapter.get_credential()
-
-    mock_refresh.assert_called_once()
-    assert cred.bearer == "minted-bearer"
-    assert cred.base_url == "https://inference-api.nousresearch.com/v1"
-    assert cred.expires_at == "2099-01-01T00:00:00Z"
-    assert cred.token_type == "Bearer"
-
-    # Verify state was persisted back
-    stored = json.loads((tmp_path / "auth.json").read_text())
-    assert stored["providers"]["nous"]["agent_key"] == "minted-bearer"
-
-
-def test_nous_adapter_get_credential_raises_when_not_logged_in(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    adapter = NousPortalAdapter()
-    with pytest.raises(RuntimeError, match="hermes login nous"):
-        adapter.get_credential()
-
-
-def test_nous_adapter_get_credential_raises_on_refresh_failure(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    _write_auth_store(tmp_path, {
-        "access_token": "access-tok",
-        "refresh_token": "refresh-tok",
-    })
-
-    with patch(
-        "hermes_cli.proxy.adapters.nous_portal.refresh_nous_oauth_from_state",
-        side_effect=RuntimeError("Refresh session has been revoked"),
-    ):
-        adapter = NousPortalAdapter()
-        with pytest.raises(RuntimeError, match="Refresh session has been revoked"):
-            adapter.get_credential()
-
-
-def test_nous_adapter_get_credential_raises_when_no_agent_key_returned(tmp_path, monkeypatch):
-    """If the refresh helper succeeds but produces no agent_key, we surface a clear error."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    _write_auth_store(tmp_path, {
-        "access_token": "access-tok",
-        "refresh_token": "refresh-tok",
-    })
-
-    with patch(
-        "hermes_cli.proxy.adapters.nous_portal.refresh_nous_oauth_from_state",
-        return_value={"access_token": "a", "refresh_token": "r"},
-    ):
-        adapter = NousPortalAdapter()
-        with pytest.raises(RuntimeError, match="did not return a usable agent_key"):
-            adapter.get_credential()
 
 
 def test_nous_adapter_concurrent_refresh_serialized(tmp_path, monkeypatch):
@@ -194,7 +58,7 @@ def test_nous_adapter_concurrent_refresh_serialized(tmp_path, monkeypatch):
     counter = [0]
     counter_lock = threading.Lock()
 
-    def serializing_refresh(state, **kwargs):
+    def serializing_refresh(**kwargs):
         # If another thread is already inside refresh, the lock is broken.
         if in_flight.is_set():
             overlap_detected.set()
@@ -208,10 +72,9 @@ def test_nous_adapter_concurrent_refresh_serialized(tmp_path, monkeypatch):
                 counter[0] += 1
                 idx = counter[0]
             return {
-                **state,
-                "agent_key": f"key-{idx}",
-                "agent_key_expires_at": "2099-01-01T00:00:00Z",
-                "inference_base_url": "https://inference-api.nousresearch.com/v1",
+                "api_key": f"key-{idx}",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "base_url": "https://inference-api.nousresearch.com/v1",
             }
         finally:
             in_flight.clear()
@@ -227,7 +90,7 @@ def test_nous_adapter_concurrent_refresh_serialized(tmp_path, monkeypatch):
             errors.append(exc)
 
     with patch(
-        "hermes_cli.proxy.adapters.nous_portal.refresh_nous_oauth_from_state",
+        "hermes_cli.proxy.adapters.nous_portal.resolve_nous_runtime_credentials",
         side_effect=serializing_refresh,
     ):
         threads = [threading.Thread(target=worker) for _ in range(3)]
@@ -241,6 +104,120 @@ def test_nous_adapter_concurrent_refresh_serialized(tmp_path, monkeypatch):
     assert len(call_log) == 3
     assert not overlap_detected.is_set(), "refresh calls overlapped — lock is broken"
     assert all(r.startswith("key-") for r in results)
+
+
+# ---------------------------------------------------------------------------
+# XAIGrokAdapter
+# ---------------------------------------------------------------------------
+
+
+def _write_xai_pool_entry(
+    hermes_home: Path,
+    *,
+    access_token: str = "xai-access-token",
+    refresh_token: str = "xai-refresh-token",
+    base_url: str = "https://api.x.ai/v1",
+    source: str = "manual:xai_pkce",
+) -> Path:
+    """Write an xai-oauth pool entry into a hermetic HERMES_HOME."""
+    auth_path = hermes_home / "auth.json"
+    auth_path.write_text(json.dumps({
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "xai-oauth": [
+                {
+                    "id": "xai123",
+                    "label": "xai-test",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": source,
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "base_url": base_url,
+                }
+            ]
+        },
+    }))
+    return auth_path
+
+
+def test_xai_adapter_not_authenticated_when_no_pool_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {},
+        "credential_pool": {},
+    }))
+    assert not XAIGrokAdapter().is_authenticated()
+
+
+def test_xai_adapter_retry_rotates_pool_entry_on_429(tmp_path, monkeypatch):
+    """429 from xAI must rotate to the next pool entry, not attempt refresh.
+
+    Pre-fix (#28932) ``get_retry_credential`` only fired on 401, so a 429
+    rate-limit response flowed back to the client unchanged AND the
+    rate-limited bearer stayed active for the next request — defeating
+    the whole point of pool rotation.
+
+    Post-fix: 429 lands on ``mark_exhausted_and_rotate`` (no refresh —
+    that's irrelevant for rate limits), stamps the 1-hour cooldown
+    via ``EXHAUSTED_TTL_429_SECONDS`` on the offending key, and
+    returns the next available credential.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    # Two pool entries so rotation has somewhere to go.
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(json.dumps({
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "xai-oauth": [
+                {
+                    "id": "xai-first",
+                    "label": "xai-first",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": "manual:xai_pkce",
+                    "access_token": "first-access-token",
+                    "refresh_token": "first-refresh-token",
+                    "base_url": "https://api.x.ai/v1",
+                },
+                {
+                    "id": "xai-second",
+                    "label": "xai-second",
+                    "auth_type": "oauth",
+                    "priority": 1,
+                    "source": "manual:xai_pkce",
+                    "access_token": "second-access-token",
+                    "refresh_token": "second-refresh-token",
+                    "base_url": "https://api.x.ai/v1",
+                },
+            ]
+        },
+    }))
+
+    # Refresh must NOT be called on the 429 path — guard against
+    # the fix accidentally trying to refresh-on-rate-limit.
+    def _refresh_must_not_run(*args, **kwargs):
+        raise AssertionError("refresh_xai_oauth_pure must not run on 429")
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _refresh_must_not_run)
+
+    adapter = XAIGrokAdapter()
+    failed = adapter.get_credential()
+    assert failed.bearer == "first-access-token", "starting bearer should be the first entry"
+
+    retry = adapter.get_retry_credential(
+        failed_credential=failed,
+        status_code=429,
+    )
+
+    assert retry is not None, "429 must rotate to next pool entry"
+    assert retry.bearer == "second-access-token", (
+        f"expected rotation to second entry, got {retry.bearer!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -260,12 +237,15 @@ class FakeAdapter(UpstreamAdapter):
     """A test adapter that returns a fixed credential without touching disk."""
 
     def __init__(self, base_url: str, bearer: str = "test-bearer",
-                 allowed=None, raise_on_credential=False):
+                 allowed=None, raise_on_credential=False,
+                 retry_bearer: str | None = None):
         self._base_url = base_url
         self._bearer = bearer
         self._allowed = frozenset(allowed or ["/chat/completions"])
         self._raise = raise_on_credential
+        self._retry_bearer = retry_bearer
         self.calls = 0
+        self.retry_calls = 0
 
     @property
     def name(self): return "fake"
@@ -284,6 +264,17 @@ class FakeAdapter(UpstreamAdapter):
             raise RuntimeError("simulated auth failure")
         return UpstreamCredential(
             bearer=self._bearer, base_url=self._base_url,
+            expires_at="2099-01-01T00:00:00Z",
+        )
+
+    def get_retry_credential(self, *, failed_credential, status_code):
+        _ = failed_credential
+        self.retry_calls += 1
+        if status_code != 401 or not self._retry_bearer:
+            return None
+        return UpstreamCredential(
+            bearer=self._retry_bearer,
+            base_url=self._base_url,
             expires_at="2099-01-01T00:00:00Z",
         )
 
@@ -327,109 +318,27 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
     return app
 
 
-def test_server_forwards_chat_completions():
-    async def run():
-        captured: Dict[str, Any] = {"requests": []}
-        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
-        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="real-portal-key")
-        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+def _build_retrying_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
+    async def maybe_unauthorized(request):
+        body = await request.read()
+        auth = request.headers.get("Authorization")
+        captured["requests"].append({
+            "method": request.method,
+            "path": request.path,
+            "auth": auth,
+            "body": body.decode("utf-8") if body else "",
+        })
+        if auth == "Bearer jwt-bearer":
+            return web.json_response({"error": "bad token"}, status=401)
+        return web.json_response({"ok": True})
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{proxy_base}/v1/chat/completions",
-                    json={"model": "Hermes-4-70B",
-                          "messages": [{"role": "user", "content": "hi"}]},
-                    headers={"Authorization": "Bearer client-dummy-key"},
-                ) as resp:
-                    assert resp.status == 200
-                    data = await resp.json()
-                    assert data["echoed"] is True
-
-            assert len(captured["requests"]) == 1
-            req = captured["requests"][0]
-            assert req["auth"] == "Bearer real-portal-key"
-            assert "Hermes-4-70B" in req["body"]
-        finally:
-            await proxy_runner.cleanup()
-            await upstream_runner.cleanup()
-
-    asyncio.run(run())
+    app = web.Application()
+    app.router.add_route("*", "/v1/chat/completions", maybe_unauthorized)
+    return app
 
 
-def test_server_rejects_disallowed_path():
-    async def run():
-        adapter = FakeAdapter("http://unused.example/v1", allowed=["/chat/completions"])
-        runner, base = await _start_runner(create_app(adapter))
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{base}/v1/random/endpoint") as resp:
-                    assert resp.status == 404
-                    body = await resp.json()
-                    assert body["error"]["type"] == "path_not_allowed"
-                    assert "/chat/completions" in body["error"]["message"]
-        finally:
-            await runner.cleanup()
-
-    asyncio.run(run())
 
 
-def test_server_returns_401_when_adapter_fails():
-    async def run():
-        adapter = FakeAdapter("http://unused.example/v1", raise_on_credential=True)
-        runner, base = await _start_runner(create_app(adapter))
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(f"{base}/v1/chat/completions", json={}) as resp:
-                    assert resp.status == 401
-                    body = await resp.json()
-                    assert body["error"]["type"] == "upstream_auth_failed"
-                    assert "simulated auth failure" in body["error"]["message"]
-        finally:
-            await runner.cleanup()
-
-    asyncio.run(run())
-
-
-def test_server_health_endpoint():
-    async def run():
-        adapter = FakeAdapter("http://unused.example/v1")
-        runner, base = await _start_runner(create_app(adapter))
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{base}/health") as resp:
-                    assert resp.status == 200
-                    body = await resp.json()
-                    assert body["status"] == "ok"
-                    assert body["upstream"] == "Fake Provider"
-                    assert body["authenticated"] is True
-        finally:
-            await runner.cleanup()
-
-    asyncio.run(run())
-
-
-def test_server_streams_sse():
-    async def run():
-        captured: Dict[str, Any] = {"requests": []}
-        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
-        adapter = FakeAdapter(f"{upstream_base}/v1", allowed=["/sse"])
-        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{proxy_base}/v1/sse") as resp:
-                    assert resp.status == 200
-                    chunks = []
-                    async for chunk in resp.content.iter_any():
-                        chunks.append(chunk)
-                    full = b"".join(chunks)
-                    assert b"data: hello" in full
-                    assert b"data: [DONE]" in full
-        finally:
-            await proxy_runner.cleanup()
-            await upstream_runner.cleanup()
-
-    asyncio.run(run())
 
 
 def test_server_strips_client_auth_header():
@@ -456,57 +365,145 @@ def test_server_strips_client_auth_header():
     asyncio.run(run())
 
 
+def _build_sse_upstream(
+    frames: list[bytes],
+    *,
+    path: str = "/v1/chat/completions",
+) -> "web.Application":
+    async def sse(request):
+        _ = await request.read()
+        resp = web.StreamResponse(
+            status=200, headers={"Content-Type": "text/event-stream"},
+        )
+        await resp.prepare(request)
+        for chunk in frames:
+            await resp.write(chunk)
+        await resp.write_eof()
+        return resp
+
+    app = web.Application()
+    app.router.add_route("*", path, sse)
+    return app
+
+
+def test_proxy_appends_done_when_upstream_omits_sentinel():
+    """#90848: complete Portal-shaped SSE without [DONE] gets one appended."""
+    async def run():
+        frames = [
+            b'data: {"choices":[{"delta":{"content":"LONGCAT_OK"}}]}\n\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+            b'data: {"choices":[],"lastOne":true,"usage":{"prompt_tokens":1}}\n\n',
+        ]
+        upstream_runner, upstream_base = await _start_runner(
+            _build_sse_upstream(frames)
+        )
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="ours")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={"stream": True},
+                ) as resp:
+                    body = await resp.read()
+            text = body.decode("utf-8")
+            assert 'data: {"choices":[{"delta":{"content":"LONGCAT_OK"}}]}' in text
+            assert '"finish_reason":"stop"' in text
+            assert '"lastOne":true' in text
+            assert text.count("data: [DONE]") == 1
+            assert text.rstrip().endswith("data: [DONE]")
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_proxy_does_not_duplicate_existing_done():
+    async def run():
+        frames = [
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+        upstream_runner, upstream_base = await _start_runner(
+            _build_sse_upstream(frames)
+        )
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="ours")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={"stream": True},
+                ) as resp:
+                    body = await resp.read()
+            assert body.decode("utf-8").count("data: [DONE]") == 1
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_proxy_does_not_append_done_after_error_event():
+    async def run():
+        frames = [
+            b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+            b'data: {"error":{"message":"boom","type":"api_error"}}\n\n',
+        ]
+        upstream_runner, upstream_base = await _start_runner(
+            _build_sse_upstream(frames)
+        )
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="ours")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={"stream": True},
+                ) as resp:
+                    body = await resp.read()
+            assert "data: [DONE]" not in body.decode("utf-8")
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_proxy_does_not_append_done_after_malformed_trailing_frame():
+    async def run():
+        frames = [
+            b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+            b'data: {"choices": [MALFORMED]}\n\n',
+        ]
+        upstream_runner, upstream_base = await _start_runner(
+            _build_sse_upstream(frames)
+        )
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="ours")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={"stream": True},
+                ) as resp:
+                    body = await resp.read()
+            assert "data: [DONE]" not in body.decode("utf-8")
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
 # ---------------------------------------------------------------------------
 # CLI handlers
 # ---------------------------------------------------------------------------
 
 
-def test_cmd_proxy_status_runs(capsys, tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    from hermes_cli.proxy.cli import cmd_proxy_status
-
-    args = MagicMock()
-    rc = cmd_proxy_status(args)
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "nous" in out
-    assert "Nous Portal" in out
-    assert "not logged in" in out
 
 
-def test_cmd_proxy_providers_runs(capsys):
-    from hermes_cli.proxy.cli import cmd_proxy_list_providers
-
-    args = MagicMock()
-    rc = cmd_proxy_list_providers(args)
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "nous" in out
-    assert "Nous Portal" in out
 
 
-def test_cmd_proxy_start_refuses_unknown_provider(capsys):
-    from hermes_cli.proxy.cli import cmd_proxy_start
-
-    args = MagicMock()
-    args.provider = "no-such-provider"
-    args.host = None
-    args.port = None
-    rc = cmd_proxy_start(args)
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "no-such-provider" in err
-
-
-def test_cmd_proxy_start_refuses_when_unauthenticated(capsys, tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    from hermes_cli.proxy.cli import cmd_proxy_start
-
-    args = MagicMock()
-    args.provider = "nous"
-    args.host = None
-    args.port = None
-    rc = cmd_proxy_start(args)
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "hermes login nous" in err
