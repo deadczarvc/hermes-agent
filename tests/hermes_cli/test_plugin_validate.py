@@ -11,6 +11,7 @@ from pathlib import Path
 
 import hermes_yaml as yaml
 
+from hermes_platform.host.facts import os_family
 from hermes_cli.plugin_validate import validate_plugin_dir
 from hermes_cli.plugin_validate_desktop import desktop_surface_hits, is_desktop_surface
 
@@ -59,13 +60,13 @@ def test_portable_validation_fails_orphan_and_reports_availability(tmp_path: Pat
         tmp_path / "declared",
         {"worker": {"type": "stdio", "command": "python"}},
         {"worker": {
-            "app": {"darwin": {"presence": "executable", "location": str(app)}},
+            "app": {os_family(): {"presence": "executable", "location": str(app)}},
             "requires": {"app": True},
         }},
     )
     report = validate_plugin_dir(declared)
     assert any(
-        name == "server availability: worker" and ok and detail in {"missing_app", "unsupported_os"}
+        name == "server availability: worker" and ok and detail.split(",")[0].strip() in {"missing_app", "unsupported_os"}
         for name, ok, detail in report.checks
     )
 
